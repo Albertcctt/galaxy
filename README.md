@@ -150,13 +150,8 @@ stats    { files, links, unresolvedIncludes }
   nodes without links
 - The layout is O(n²) — rendering is capped at ~10,000 nodes (the app refuses
   larger scans with a hint)
-- Desktop builds are Windows-only for now; the exe uses the default Unity icon
+- Desktop builds are Windows-only for now
 - UI text is English; code comments and logs are Chinese
-
-## Development
-
-Automation workflow (marker-file injection, dual-screenshot verification),
-Unity pitfalls and debugging laws are documented in **`CLAUDE.md`**.
 
 ## License
 

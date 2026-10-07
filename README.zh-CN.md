@@ -139,13 +139,9 @@ stats    { files, links, unresolvedIncludes }
 
 - 依赖抽取目前只支持 C/C++（`#include`）；其他语言的文件是节点但无连线
 - 布局复杂度 O(n²)，渲染上限约 1 万节点（超出时应用拒绝重建并提示）
-- 桌面构建目前仅 Windows；exe 使用 Unity 默认图标
+- 桌面构建目前仅 Windows
 - 界面文案为英文；代码注释与日志为中文
 
-## 开发
-
-自动化重跑（标记文件注入、双截图验证）、Unity 陷阱清单与调试铁律见
-**`CLAUDE.md`**。
 
 ## 许可
 
