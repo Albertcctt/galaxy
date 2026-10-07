@@ -1,0 +1,31 @@
+# ============ Unity (galaxy_project) ============
+galaxy_project/[Ll]ibrary/
+galaxy_project/[Tt]emp/
+galaxy_project/[Oo]bj/
+galaxy_project/[Bb]uild/
+galaxy_project/[Bb]uilds/
+galaxy_project/[Ll]ogs/
+galaxy_project/[Uu]ser[Ss]ettings/
+galaxy_project/[Mm]emoryCaptures/
+galaxy_project/.vs/
+*.csproj
+*.sln
+*.slnx
+*.user
+*.pidb
+*.booproj
+*.unitypackage
+sysinfo.txt
+
+# ============ C++ scanner ============
+scanner/build/
+scanner/bin/
+scanner/galaxy.json
+*.o
+
+# ============ 桌面应用构建产物 ============
+dist/
+asset/
+
+CLAUDE.md
+.vscode
