@@ -75,7 +75,7 @@ namespace Galaxy.EditorTools
         {
             try
             {
-                Debug.Log("[GalaxyBootstrap] 检测到引导标记：装配场景并进入演示流程 (run-42)");
+                Debug.Log("[GalaxyBootstrap] 检测到引导标记：装配场景并进入演示流程 (run-58)");
                 GalaxySceneSetup.SetupInternal(interactive: false);
                 GalaxyAutoPlay.Begin();
             }

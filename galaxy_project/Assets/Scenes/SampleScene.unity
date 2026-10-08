@@ -170,10 +170,12 @@ MonoBehaviour:
   universeGap: 3
   universeWallFrac: 0.85
   scatteredRadiusScale: 2.6
-  blackHoleRadiusScale: 0.55
+  blackHoleRadiusScale: 0.7
   universeBaseAlpha: 0.005
   universeRimAlpha: 0.055
   universeRimPower: 4.5
+  dustBase: 300
+  dustPerFile: 2
 --- !u!4 &255589230
 Transform:
   m_ObjectHideFlags: 0

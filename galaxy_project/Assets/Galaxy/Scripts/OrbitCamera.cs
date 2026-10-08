@@ -69,6 +69,17 @@ namespace Galaxy
             ApplyPose(instant: true);
         }
 
+        /// <summary>
+        /// 视点引导：把注视点平滑移到目标、必要时拉近（绝不把用户拉远——只在
+        /// 当前距离比目标距离更远时收拢；方向（yaw/pitch）保持不变，只动
+        /// target 与 distance，交给 ApplyPose 的指数阻尼自然滑过去）。
+        /// </summary>
+        public void FocusOn(Vector3 newTarget, float distance)
+        {
+            target = newTarget;
+            m_Distance = Mathf.Clamp(Mathf.Min(m_Distance, distance), minDistance, maxDistance);
+        }
+
         // 立即恢复"最后一次 SetOrbit 设定的取景姿态"，清掉用户手动缩放/旋转/平移的偏移。
         // 用途：自动化截图前调用，保证每轮截出的都是同一个标准视角（结果可比）。
         public void ReframeInstant()

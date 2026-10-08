@@ -22,10 +22,13 @@
 //   j = 0..n-1 固定顺序累加 —— 浮点加法顺序与串行实现完全一致，
 //   线程调度不影响结果。初值（GalaxyLayout 的种子）本身也是确定性的。
 //
-// 复杂度：斥力 O(n²)。n ≈ 2k 时每轮 356 万次力计算（全对全，不做 i<j
-//   对称优化：否则两个线程会写同一个 disp 元素产生数据竞争），多核并行
-//   单轮仅几毫秒。若仓库规模涨到上万文件，把斥力段换成 Barnes-Hut 八叉树
-//   （质心近似，O(n log n)）即可，外部接口不变。
+// 复杂度（v2：性能层，渲染上限从 1 万抬到数万级）：
+//   - 斥力：Barnes-Hut 八叉树质心近似 O(n log n)（θ=0.75）。每轮重建一棵树
+//     （宇宙模式 = 每宇宙一棵，天然隔离跨宇宙作用），查询为只读并行遍历。
+//   - 接触力与碰撞解算/违规计数：空间哈希网格（桶内按下标升序、查询按固定
+//     27 邻域顺序）——三套结构把布局代价从平方级压到近线性。
+//   确定性不变：树按粒子下标顺序插入（质心增量累加顺序固定）、网格按下标
+//   顺序填充、并行查询只读 —— 与旧的全对全固定循环一样可复现。
 //
 // 宇宙模式（Multiverse，可选 universe 参数非空时启用）：
 //   每个节点属于一个"宇宙"（第一层文件夹的球体，见 UniverseLayout）。物理改为：
@@ -74,6 +77,271 @@ namespace Galaxy
             public Vector3[][] anchorOf;  // 每个节点的引力核链（[0] = 宇宙球心，越深越强）
             public float[][] anchorStiffness;   // 对应引力强度
         }
+
+        // ==================================================================
+        // Barnes-Hut 八叉树：斥力的 O(n²) 全对全 → O(n log n) 质心近似。
+        //   - 构建：按粒子下标顺序插入，质心/质量沿插入路径增量累加 —— 顺序
+        //     固定 => 确定性（与旧版固定 j 循环同一哲学）。
+        //   - 查询：只读遍历（手工栈，无递归 / 无分配），Parallel.For 下安全。
+        //   - 数据结构：SoA 平铺数组按需倍增（C++ 视角：预分配竞技场 + 扩容，
+        //     而不是每个树节点 new 一个对象）。
+        //   - 极端重合：叶子细分到分辨率下限后多余粒子挂链在叶子上，
+        //     查询时逐个精确求和（近似失真只发生在"本来就要接触挤压"的区域）。
+        // ==================================================================
+        private const float BhTheta = 0.75f;   // 近似判定：节点边长/距离 < θ 用质心聚合
+
+        private sealed class Octree
+        {
+            private const float MinHalf = 0.02f;   // 叶子最小半边长（细分分辨率下限）
+            private const int StackCap = 512;      // 查询栈容量（深度 × 8 待访兄弟，够用）
+
+            private float[] mGeoX = new float[1024], mGeoY = new float[1024], mGeoZ = new float[1024];
+            private float[] mComX = new float[1024], mComY = new float[1024], mComZ = new float[1024];
+            private float[] mMass = new float[1024];
+            private float[] mHalf = new float[1024];
+            private int[] mChildBase = new int[1024];
+            private int[] mFirstBody = new int[1024];
+            private int[] mNextBody = System.Array.Empty<int>();
+            private int mCount;
+            private readonly int[] mStack = new int[StackCap];
+
+            /// <summary>重建树。members = null 表示全体节点（传统模式）。</summary>
+            public void Build(Vector3[] pos, List<int> members, int n)
+            {
+                mCount = 0;
+                if (mNextBody.Length < n) mNextBody = new int[n];
+                bool global = members == null;
+                int count = global ? n : members.Count;
+
+                // 根包围盒：全体成员 AABB 立方体化（+1 边距防边界粒子落格）
+                float minX = float.MaxValue, minY = float.MaxValue, minZ = float.MaxValue;
+                float maxX = float.MinValue, maxY = float.MinValue, maxZ = float.MinValue;
+                for (int t = 0; t < count; t++)
+                {
+                    Vector3 p = pos[global ? t : members[t]];
+                    minX = Mathf.Min(minX, p.x); maxX = Mathf.Max(maxX, p.x);
+                    minY = Mathf.Min(minY, p.y); maxY = Mathf.Max(maxY, p.y);
+                    minZ = Mathf.Min(minZ, p.z); maxZ = Mathf.Max(maxZ, p.z);
+                }
+                if (count == 0) { minX = minY = minZ = 0f; maxX = maxY = maxZ = 1f; }
+                float half = Mathf.Max(maxX - minX, Mathf.Max(maxY - minY, maxZ - minZ)) * 0.5f + 1f;
+                AllocNode((minX + maxX) * 0.5f, (minY + maxY) * 0.5f, (minZ + maxZ) * 0.5f, half);
+
+                for (int t = 0; t < count; t++)
+                {
+                    int body = global ? t : members[t];
+                    Insert(body, pos);
+                }
+            }
+
+            private int AllocNode(float gx, float gy, float gz, float half)
+            {
+                if (mCount == mGeoX.Length) Grow();
+                int i = mCount++;
+                mGeoX[i] = gx; mGeoY[i] = gy; mGeoZ[i] = gz; mHalf[i] = half;
+                mComX[i] = 0f; mComY[i] = 0f; mComZ[i] = 0f; mMass[i] = 0f;
+                mChildBase[i] = -1; mFirstBody[i] = -1;
+                return i;
+            }
+
+            private void Grow()
+            {
+                int cap = mGeoX.Length * 2;
+                System.Array.Resize(ref mGeoX, cap); System.Array.Resize(ref mGeoY, cap);
+                System.Array.Resize(ref mGeoZ, cap);
+                System.Array.Resize(ref mComX, cap); System.Array.Resize(ref mComY, cap);
+                System.Array.Resize(ref mComZ, cap);
+                System.Array.Resize(ref mMass, cap); System.Array.Resize(ref mHalf, cap);
+                System.Array.Resize(ref mChildBase, cap); System.Array.Resize(ref mFirstBody, cap);
+            }
+
+            private int Octant(int node, Vector3 p)
+            {
+                return (p.x >= mGeoX[node] ? 1 : 0)
+                     | (p.y >= mGeoY[node] ? 2 : 0)
+                     | (p.z >= mGeoZ[node] ? 4 : 0);
+            }
+
+            private void AddAggregate(int node, Vector3 p)
+            {
+                float m = (mMass[node] += 1f);
+                float inv = 1f / m;
+                mComX[node] += (p.x - mComX[node]) * inv;
+                mComY[node] += (p.y - mComY[node]) * inv;
+                mComZ[node] += (p.z - mComZ[node]) * inv;
+            }
+
+            private void Subdivide(int node)
+            {
+                while (mCount + 8 > mGeoX.Length) Grow();
+                float half = mHalf[node] * 0.5f;
+                float q = half * 0.5f;   // 子节点几何中心相对父中心的偏移
+                float gx = mGeoX[node], gy = mGeoY[node], gz = mGeoZ[node];
+                int baseIdx = mCount;
+                mCount += 8;
+                for (int o = 0; o < 8; o++)
+                {
+                    int i = baseIdx + o;
+                    mGeoX[i] = gx + ((o & 1) != 0 ? q : -q);
+                    mGeoY[i] = gy + ((o & 2) != 0 ? q : -q);
+                    mGeoZ[i] = gz + ((o & 4) != 0 ? q : -q);
+                    mHalf[i] = half; mMass[i] = 0f;
+                    mComX[i] = 0f; mComY[i] = 0f; mComZ[i] = 0f;
+                    mChildBase[i] = -1; mFirstBody[i] = -1;
+                }
+                mChildBase[node] = baseIdx;
+            }
+
+            private void Insert(int body, Vector3[] pos)
+            {
+                Vector3 p = pos[body];
+                int node = 0;
+                while (true)
+                {
+                    AddAggregate(node, p);   // 每访问一个节点恰好叠加一次
+
+                    if (mChildBase[node] >= 0)
+                    {
+                        node = mChildBase[node] + Octant(node, p);
+                        continue;
+                    }
+                    // 叶子
+                    if (mFirstBody[node] < 0)
+                    {
+                        mFirstBody[node] = body;
+                        mNextBody[body] = -1;
+                        return;
+                    }
+                    if (mHalf[node] <= MinHalf)
+                    {
+                        // 分辨率下限：挂链，查询时逐个精确求和
+                        mNextBody[body] = mFirstBody[node];
+                        mFirstBody[node] = body;
+                        return;
+                    }
+                    // 细分并把旧链下放到 8 个子叶（聚合随之转移）
+                    Subdivide(node);
+                    int b = mFirstBody[node];
+                    mFirstBody[node] = -1;
+                    while (b >= 0)
+                    {
+                        int nb = mNextBody[b];
+                        Vector3 bp = pos[b];
+                        int child = mChildBase[node] + Octant(node, bp);
+                        mNextBody[b] = mFirstBody[child];
+                        mFirstBody[child] = b;
+                        AddAggregate(child, bp);
+                        b = nb;
+                    }
+                    // 本粒子继续下探（本节点已叠加过，直接进子节点）
+                    node = mChildBase[node] + Octant(node, p);
+                }
+            }
+
+            /// <summary>
+            /// 累计 p 受到的斥力（近似）：远节点用质心聚合，近节点/含自身节点细分，
+            /// 叶子逐个精确。cutoff=true 时对超过截断距离的节点不施力（宇宙模式
+            /// 的"短程截断"：没有全局气压，星团间空隙才保得住）。
+            /// </summary>
+            public void AccumulateRepulsion(Vector3[] pos, Vector3 p, int self, float repK,
+                                            bool cutoff, float cutSq,
+                                            ref float ax, ref float ay, ref float az)
+            {
+                int sp = 0;
+                mStack[sp++] = 0;
+                while (sp > 0)
+                {
+                    int node = mStack[--sp];
+
+                    if (mChildBase[node] < 0)
+                    {
+                        // 叶：链上逐个精确（跳过自身）
+                        for (int b = mFirstBody[node]; b >= 0; b = mNextBody[b])
+                        {
+                            if (b == self) continue;
+                            float dx = p.x - pos[b].x;
+                            float dy = p.y - pos[b].y;
+                            float dz = p.z - pos[b].z;
+                            float d2 = dx * dx + dy * dy + dz * dz;
+                            if (cutoff && d2 > cutSq) continue;
+                            float f = repK / (d2 + 0.01f);
+                            ax += dx * f; ay += dy * f; az += dz * f;
+                        }
+                        continue;
+                    }
+
+                    float dxc = p.x - mComX[node];
+                    float dyc = p.y - mComY[node];
+                    float dzc = p.z - mComZ[node];
+                    float d2c = dxc * dxc + dyc * dyc + dzc * dzc;
+
+                    // 含自身的节点不能用聚合（会把自身算进去）→ 必须细分
+                    bool containsSelf =
+                        Mathf.Abs(p.x - mGeoX[node]) <= mHalf[node] &&
+                        Mathf.Abs(p.y - mGeoY[node]) <= mHalf[node] &&
+                        Mathf.Abs(p.z - mGeoZ[node]) <= mHalf[node];
+                    float s = mHalf[node] * 2f;
+                    if (!containsSelf && s * s < BhTheta * BhTheta * d2c)
+                    {
+                        if (cutoff && d2c > cutSq) continue;
+                        float f = repK * mMass[node] / (d2c + 0.01f);
+                        ax += dxc * f; ay += dyc * f; az += dzc * f;
+                        continue;
+                    }
+
+                    if (sp + 8 > StackCap) continue;   // 栈满保险（正常深度远达不到）
+                    int b0 = mChildBase[node];
+                    for (int o = 0; o < 8; o++) mStack[sp++] = b0 + o;
+                }
+            }
+        }
+
+        // ==================================================================
+        // 空间哈希网格（容器复用版）：接触力（Simulate 内）与碰撞解算 /
+        // 违规计数共用。桶按下标升序填充、查询按固定 27 邻域顺序遍历
+        // => 与八叉树同款的确定性。cell 尺寸约定：≥ 2×最大半径 ——
+        // 任意互侵对的间距 < need ≤ 2×maxR ≤ cell，必落在邻域内。
+        // ==================================================================
+        private sealed class SpatialGrid
+        {
+            private readonly Dictionary<(int, int, int), List<int>> mCells =
+                new Dictionary<(int, int, int), List<int>>();
+            private readonly Stack<List<int>> mPool = new Stack<List<int>>();
+
+            public void Clear()
+            {
+                foreach (KeyValuePair<(int, int, int), List<int>> kv in mCells)
+                {
+                    kv.Value.Clear();
+                    mPool.Push(kv.Value);
+                }
+                mCells.Clear();
+            }
+
+            public void Add(Vector3 p, float cell, int index)
+            {
+                var key = (Mathf.FloorToInt(p.x / cell),
+                           Mathf.FloorToInt(p.y / cell),
+                           Mathf.FloorToInt(p.z / cell));
+                if (!mCells.TryGetValue(key, out List<int> list))
+                {
+                    list = mPool.Count > 0 ? mPool.Pop() : new List<int>();
+                    mCells[key] = list;
+                }
+                list.Add(index);
+            }
+
+            public List<int> Get(int x, int y, int z)
+            {
+                return mCells.TryGetValue((x, y, z), out List<int> list) ? list : null;
+            }
+        }
+
+        // 复用的结构实例（单线程构建 → 并行只读查询；Simulate 不会并发调用）
+        private static readonly Octree s_GlobalTree = new Octree();
+        private static readonly List<Octree> s_UniverseTrees = new List<Octree>();
+        private static readonly List<List<int>> s_UniverseMembers = new List<List<int>>();
+        private static readonly SpatialGrid s_ContactGrid = new SpatialGrid();
 
         /// <summary>
         /// 从 seed 位置出发做力导向收敛，返回收敛后的新位置数组（长度不变）。
@@ -138,48 +406,92 @@ namespace Galaxy
             float contactK = Mathf.Max(0f, p.contactStiffness);
             int iterations = Mathf.Max(1, p.iterations);
 
+            // ---- 结构预备：接触网格 cell 尺寸（≥ 2×最大半径）与宇宙成员清单 ----
+            float maxEntityR = 0f;
+            for (int i = 0; i < n; i++) maxEntityR = Mathf.Max(maxEntityR, entityRadius[i]);
+            float contactCell = Mathf.Max(maxEntityR * 2f, 0.5f);
+
+            int universeCount = 0;
+            if (universe != null)
+            {
+                for (int i = 0; i < n; i++)
+                    universeCount = Mathf.Max(universeCount, universe.universeOf[i] + 1);
+                s_UniverseMembers.Clear();
+                for (int u = 0; u < universeCount; u++) s_UniverseMembers.Add(new List<int>());
+                for (int i = 0; i < n; i++) s_UniverseMembers[universe.universeOf[i]].Add(i);
+                while (s_UniverseTrees.Count < universeCount) s_UniverseTrees.Add(new Octree());
+            }
+
             for (int iter = 0; iter < iterations; iter++)
             {
                 float temperature = p.startTemperature * (1f - (float)iter / iterations);
 
-                // ---- 1) 全局斥力 + 硬核接触力（对 i 并行；j 循环在单线程内固定顺序）----
+                // ---- 0) 重建斥力结构（串行构建 => 确定性；查询阶段只读）----
+                if (universe == null)
+                {
+                    s_GlobalTree.Build(pos, null, n);
+                }
+                else
+                {
+                    // 宇宙模式：每宇宙一棵树 —— 跨宇宙作用天然被隔离
+                    for (int u = 0; u < universeCount; u++)
+                        s_UniverseTrees[u].Build(pos, s_UniverseMembers[u], n);
+                }
+                s_ContactGrid.Clear();
+                for (int i = 0; i < n; i++) s_ContactGrid.Add(pos[i], contactCell, i);
+
+                // ---- 1) 斥力（Barnes-Hut 质心近似 O(n log n)）+ 硬核接触力（网格 27 邻域）----
+                // 树/网格只在读侧使用；每个 i 的遍历顺序固定 => 与旧版一样可复现
                 Parallel.For(0, n, i =>
                 {
                     Vector3 pi = pos[i];
-                    float ri = entityRadius[i];
                     float ax = 0f, ay = 0f, az = 0f;
-                    for (int j = 0; j < n; j++)
+
+                    if (universe == null)
                     {
-                        if (j == i) continue;
-                        float dx = pi.x - pos[j].x;
-                        float dy = pi.y - pos[j].y;
-                        float dz = pi.z - pos[j].z;
-                        float d2raw = dx * dx + dy * dy + dz * dz;
-                        // 宇宙模式：跨宇宙不施力（间隙 ≥ gap 已保证不接触，
-                        // 互相推挤只会把住户压在球壁附近、分布失衡）；斥力短程截断
-                        if (universe != null)
-                        {
-                            if (universe.universeOf[j] != universe.universeOf[i]) continue;
-                            if (d2raw > repCutSq) continue;
-                        }
+                        s_GlobalTree.AccumulateRepulsion(pos, pi, i, repK, false, 0f,
+                                                         ref ax, ref ay, ref az);
+                    }
+                    else
+                    {
+                        int u = universe.universeOf[i];
+                        s_UniverseTrees[u].AccumulateRepulsion(pos, pi, i, repK, true, repCutSq,
+                                                               ref ax, ref ay, ref az);
+                    }
 
-                        // 全局斥力（+0.01 软化：几乎重合时避免除零）
-                        float s = repK / (d2raw + 0.01f);
-                        ax += dx * s;
-                        ay += dy * s;
-                        az += dz * s;
-
-                        // 硬核接触力：包络球互相侵入时，越深推得越狠（线性弹簧硬度）
-                        float need = ri + entityRadius[j];
-                        if (d2raw < need * need && d2raw > 1e-8f)
+                    // 硬核接触力：包络球互相侵入时，越深推得越狠（线性弹簧硬度）
+                    int cx = Mathf.FloorToInt(pi.x / contactCell);
+                    int cy = Mathf.FloorToInt(pi.y / contactCell);
+                    int cz = Mathf.FloorToInt(pi.z / contactCell);
+                    float ri = entityRadius[i];
+                    for (int ox = -1; ox <= 1; ox++)
+                    for (int oy = -1; oy <= 1; oy++)
+                    for (int oz = -1; oz <= 1; oz++)
+                    {
+                        List<int> list = s_ContactGrid.Get(cx + ox, cy + oy, cz + oz);
+                        if (list == null) continue;
+                        for (int t = 0; t < list.Count; t++)
                         {
-                            float d = Mathf.Sqrt(d2raw);
-                            float push = contactK * (need - d) / d;
-                            ax += dx * push;
-                            ay += dy * push;
-                            az += dz * push;
+                            int j = list[t];
+                            if (j == i) continue;
+                            if (universe != null &&
+                                universe.universeOf[j] != universe.universeOf[i]) continue;
+                            float dx = pi.x - pos[j].x;
+                            float dy = pi.y - pos[j].y;
+                            float dz = pi.z - pos[j].z;
+                            float d2raw = dx * dx + dy * dy + dz * dz;
+                            float need = ri + entityRadius[j];
+                            if (d2raw < need * need && d2raw > 1e-8f)
+                            {
+                                float d = Mathf.Sqrt(d2raw);
+                                float push = contactK * (need - d) / d;
+                                ax += dx * push;
+                                ay += dy * push;
+                                az += dz * push;
+                            }
                         }
                     }
+
                     disp[i] = new Vector3(ax, ay, az);
                 });
 
@@ -302,50 +614,72 @@ namespace Galaxy
         // 关键：这是纯几何求解、没有对抗力 —— 高度数枢纽文件会把周边实体
         // 压成"焊死"的密集球（数百条长弹簧的拉力远大于代用接触力，实测
         // 接触力 8 量级完全顶不住），只有几何投影能把它逐步撬开。
-        // 顺序遍历 + 固定顺序 => 和其它阶段一样是确定性的。
-        // 复杂度 O(n²·轮数)；轻度违规几轮即净，深度卡死区可能需要数百轮
-        // （提前收敛会退出）。返回值 = 残留侵入对数（正常为 0，硬性校验数字）。
+        // 复杂度（v2 网格版）：每轮 O(n + 邻域对数) —— 空间哈希分桶后只检查
+        // 27 邻域（cell ≥ 2×最大半径 => 任意侵入对必在邻域内），大仓库不再
+        // 被平方级的对数扫描拖死。确定性：桶按下标升序填充、对子按 (i<j) 的
+        // 下标序处理，与旧版全局顺序遍历同一结果语义。
+        // 返回值 = 残留侵入对数（正常为 0，硬性校验数字）。
         // ------------------------------------------------------------------
         private const float RELAX = 0.9f;   // 每轮把一个违规对推开的比例
 
         public static int ResolveCollisions(Vector3[] pos, float[] radius, int rounds)
         {
             int n = pos.Length;
+            float maxR = 0f;
+            for (int i = 0; i < n; i++) maxR = Mathf.Max(maxR, radius[i]);
+            float cell = Mathf.Max(maxR * 2f, 0.5f);
+            var grid = new SpatialGrid();
+
             for (int round = 0; round < rounds; round++)
             {
+                grid.Clear();
+                for (int i = 0; i < n; i++) grid.Add(pos[i], cell, i);
+
                 bool violated = false;
                 for (int i = 0; i < n; i++)
                 {
-                    for (int j = i + 1; j < n; j++)
+                    int cx = Mathf.FloorToInt(pos[i].x / cell);
+                    int cy = Mathf.FloorToInt(pos[i].y / cell);
+                    int cz = Mathf.FloorToInt(pos[i].z / cell);
+                    for (int ox = -1; ox <= 1; ox++)
+                    for (int oy = -1; oy <= 1; oy++)
+                    for (int oz = -1; oz <= 1; oz++)
                     {
-                        float need = radius[i] + radius[j];
-                        float dx = pos[j].x - pos[i].x;
-                        float dy = pos[j].y - pos[i].y;
-                        float dz = pos[j].z - pos[i].z;
-                        float d2 = dx * dx + dy * dy + dz * dz;
-                        if (d2 >= need * need) continue;   // 未侵入：跳过
-
-                        float d = Mathf.Sqrt(d2);
-                        if (d < 1e-5f)
+                        List<int> list = grid.Get(cx + ox, cy + oy, cz + oz);
+                        if (list == null) continue;
+                        for (int t = 0; t < list.Count; t++)
                         {
-                            // 两实体完全重合（极端情形）：按索引生成一个确定方向
-                            float angle = i * 2.399963f;   // 黄金角，相邻索引方向错开
-                            dx = Mathf.Cos(angle);
-                            dy = Mathf.Sin(angle);
-                            dz = 0.5f;
-                            float inv = 1f / Mathf.Sqrt(dx * dx + dy * dy + dz * dz);
-                            dx *= inv; dy *= inv; dz *= inv;
-                            d = 0f;
-                        }
-                        else
-                        {
-                            dx /= d; dy /= d; dz /= d;
-                        }
+                            int j = list[t];
+                            if (j <= i) continue;   // 每个无序对只处理一次（小下标为准）
+                            float need = radius[i] + radius[j];
+                            float dx = pos[j].x - pos[i].x;
+                            float dy = pos[j].y - pos[i].y;
+                            float dz = pos[j].z - pos[i].z;
+                            float d2 = dx * dx + dy * dy + dz * dz;
+                            if (d2 >= need * need) continue;   // 未侵入：跳过
 
-                        float push = (need - d) * 0.5f * RELAX;   // 两侧各退让一半 × 松弛因子
-                        pos[i].x -= dx * push; pos[i].y -= dy * push; pos[i].z -= dz * push;
-                        pos[j].x += dx * push; pos[j].y += dy * push; pos[j].z += dz * push;
-                        violated = true;
+                            float d = Mathf.Sqrt(d2);
+                            if (d < 1e-5f)
+                            {
+                                // 两实体完全重合（极端情形）：按索引生成一个确定方向
+                                float angle = i * 2.399963f;   // 黄金角，相邻索引方向错开
+                                dx = Mathf.Cos(angle);
+                                dy = Mathf.Sin(angle);
+                                dz = 0.5f;
+                                float inv = 1f / Mathf.Sqrt(dx * dx + dy * dy + dz * dz);
+                                dx *= inv; dy *= inv; dz *= inv;
+                                d = 0f;
+                            }
+                            else
+                            {
+                                dx /= d; dy /= d; dz /= d;
+                            }
+
+                            float push = (need - d) * 0.5f * RELAX;   // 两侧各退让一半 × 松弛因子
+                            pos[i].x -= dx * push; pos[i].y -= dy * push; pos[i].z -= dz * push;
+                            pos[j].x += dx * push; pos[j].y += dy * push; pos[j].z += dz * push;
+                            violated = true;
+                        }
                     }
                 }
                 if (!violated) return 0;   // 提前收敛
@@ -354,52 +688,47 @@ namespace Galaxy
                     Debug.Log($"[Collision] 第 {round + 1} 轮：剩余侵入 {CountViolations(pos, radius)} 对");
             }
 
-            // 保险路径：轮数用尽仍有违规 —— 统计 + 诊断（最深侵入对 / 大小体积分解）
-            int leftover = 0, bigNeed = 0;
-            float worstOverlap = 0f, worstD = 0f, worstNeed = 0f;
-            int wi = -1, wj = -1;
-            for (int i = 0; i < n; i++)
+            // 保险路径：轮数用尽仍有违规 —— 返回残留计数（网格统计）
+            int leftover = CountViolations(pos, radius);
+            if (leftover > 0)
             {
-                for (int j = i + 1; j < n; j++)
-                {
-                    float need = radius[i] + radius[j];
-                    float dx = pos[j].x - pos[i].x;
-                    float dy = pos[j].y - pos[i].y;
-                    float dz = pos[j].z - pos[i].z;
-                    float d2 = dx * dx + dy * dy + dz * dz;
-                    if (d2 >= need * need) continue;
-                    leftover++;
-                    if (need > 1f) bigNeed++;   // 大体积实体对决（字体/大文件）占比
-                    float d = Mathf.Sqrt(d2);
-                    if (need - d > worstOverlap)
-                    {
-                        worstOverlap = need - d; worstD = d; worstNeed = need;
-                        wi = i; wj = j;
-                    }
-                }
-            }
-            if (wi >= 0)
-            {
-                Debug.Log($"[Collision] 最深侵入: 节点 {wi}<->{wj} 距离 {worstD:F2} / 需要 {worstNeed:F2} " +
-                          $"(半径 {radius[wi]:F2}/{radius[wj]:F2})；大体积违规 {bigNeed}/{leftover}");
+                Debug.LogWarning($"[Collision] 轮数用尽仍残留侵入 {leftover} 对（体积自适应将按其兜底）");
             }
             return leftover;
         }
 
-        // 违规计数（供日志与校验；O(n²) 单遍）
+        // 违规计数（供日志与校验；网格版 O(n + 邻域对数)）
         public static int CountViolations(Vector3[] pos, float[] radius)
         {
             int n = pos.Length;
+            float maxR = 0f;
+            for (int i = 0; i < n; i++) maxR = Mathf.Max(maxR, radius[i]);
+            float cell = Mathf.Max(maxR * 2f, 0.5f);
+            var grid = new SpatialGrid();
+            for (int i = 0; i < n; i++) grid.Add(pos[i], cell, i);
+
             int count = 0;
             for (int i = 0; i < n; i++)
             {
-                for (int j = i + 1; j < n; j++)
+                int cx = Mathf.FloorToInt(pos[i].x / cell);
+                int cy = Mathf.FloorToInt(pos[i].y / cell);
+                int cz = Mathf.FloorToInt(pos[i].z / cell);
+                for (int ox = -1; ox <= 1; ox++)
+                for (int oy = -1; oy <= 1; oy++)
+                for (int oz = -1; oz <= 1; oz++)
                 {
-                    float need = radius[i] + radius[j];
-                    float dx = pos[j].x - pos[i].x;
-                    float dy = pos[j].y - pos[i].y;
-                    float dz = pos[j].z - pos[i].z;
-                    if (dx * dx + dy * dy + dz * dz < need * need) count++;
+                    List<int> list = grid.Get(cx + ox, cy + oy, cz + oz);
+                    if (list == null) continue;
+                    for (int t = 0; t < list.Count; t++)
+                    {
+                        int j = list[t];
+                        if (j <= i) continue;
+                        float need = radius[i] + radius[j];
+                        float dx = pos[j].x - pos[i].x;
+                        float dy = pos[j].y - pos[i].y;
+                        float dz = pos[j].z - pos[i].z;
+                        if (dx * dx + dy * dy + dz * dz < need * need) count++;
+                    }
                 }
             }
             return count;

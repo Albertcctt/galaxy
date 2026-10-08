@@ -28,10 +28,23 @@ namespace Galaxy
         private RectTransform m_Panel;   // 详情面板矩形（供拾取的点击穿透判定）
         private RectTransform m_OpenBtnRect;   // OPEN PROJECT 按钮矩形（点击命中路由用）
         private Text m_OpenBtnLabel;           // 按钮文字（扫描时切换为 CANCEL SCAN）
+        private RectTransform m_SearchBoxRect;
+        private Text m_SearchText;
+        private Text m_SearchResults;
+        private RectTransform m_SettingsBtnRect;
+        private RectTransform m_SnapshotBtnRect;
+        private GameObject m_SettingsGo;
+        private RectTransform m_SettingsPanelRect;
+        private readonly Text[] m_SettingsNames = new Text[GalaxySettings.RowCount];
+        private readonly Text[] m_SettingsValues = new Text[GalaxySettings.RowCount];
+        private readonly RectTransform[,] m_StepRects = new RectTransform[GalaxySettings.RowCount, 2];
+        private RectTransform m_ApplyRect;
+        private RectTransform m_CloseSettingsRect;
         private Text m_Header;
         private Text m_Detail;
         private Text m_Hint;
         private Text m_Status;
+        private Text m_Fps;
         private bool m_Created;
 
         /// <summary>屏幕坐标是否落在详情面板内（Screen Space Overlay 下 camera 参数为 null）。</summary>
@@ -92,7 +105,93 @@ namespace Galaxy
                                   new Color(0.55f, 0.66f, 0.82f, 0.9f));
             m_Status.text = "";
             Place(m_Status.rectTransform, new Vector2(0f, 1f), new Vector2(0f, 1f),
-                  new Vector2(28f, -108f), new Vector2(900f, 60f));
+                  new Vector2(28f, -200f), new Vector2(900f, 60f));
+
+            // 搜索框（点击激活键盘输入；候选列表显示在右侧）
+            var searchGo = new GameObject("SearchBox", typeof(RectTransform));
+            searchGo.transform.SetParent(canvasGo.transform, false);
+            Image searchBg = searchGo.AddComponent<Image>();
+            searchBg.color = new Color(0.03f, 0.06f, 0.12f, 0.85f);
+            searchBg.raycastTarget = false;
+            m_SearchBoxRect = searchGo.GetComponent<RectTransform>();
+            Place(m_SearchBoxRect, new Vector2(0f, 1f), new Vector2(0f, 1f),
+                  new Vector2(28f, -112f), new Vector2(240f, 34f));
+            m_SearchText = CreateText(searchGo.transform, "Text", 15, TextAnchor.MiddleLeft,
+                                      new Color(0.62f, 0.78f, 0.92f, 0.95f));
+            m_SearchText.text = "SEARCH FILE";
+            RectTransform st = m_SearchText.rectTransform;
+            st.anchorMin = Vector2.zero;
+            st.anchorMax = Vector2.one;
+            st.offsetMin = new Vector2(10f, 0f);
+            st.offsetMax = new Vector2(-10f, 0f);
+
+            m_SearchResults = CreateText(canvasGo.transform, "SearchResults", 16, TextAnchor.UpperLeft,
+                                         new Color(0.8f, 0.88f, 1f, 0.95f));
+            m_SearchResults.text = "";
+            Place(m_SearchResults.rectTransform, new Vector2(0f, 1f), new Vector2(0f, 1f),
+                  new Vector2(276f, -112f), new Vector2(430f, 220f));
+
+            // SETTINGS / SNAPSHOT 按钮（搜索框下方一行）
+            CreateButton(canvasGo.transform, "SettingsButton", "SETTINGS",
+                         new Vector2(28f, -156f), new Vector2(104f, 34f),
+                         new Color(0.04f, 0.10f, 0.20f, 0.85f), new Color(0.50f, 0.83f, 1f, 0.95f),
+                         out m_SettingsBtnRect);
+            CreateButton(canvasGo.transform, "SnapshotButton", "SNAPSHOT",
+                         new Vector2(140f, -156f), new Vector2(104f, 34f),
+                         new Color(0.04f, 0.10f, 0.20f, 0.85f), new Color(0.50f, 0.83f, 1f, 0.95f),
+                         out m_SnapshotBtnRect);
+
+            // 设置面板（默认隐藏）：RowCount 行 参数名 | 数值 | [-][+] + APPLY(REBUILD)/CLOSE
+            // （行数与按钮位置由 GalaxySettings.RowCount 驱动，加行不用改布局代码）
+            float settingsBtnY = -46f - GalaxySettings.RowCount * 34f - 8f;
+            float settingsPanelH = -settingsBtnY + 30f + 14f;
+
+            m_SettingsGo = new GameObject("SettingsPanel", typeof(RectTransform));
+            m_SettingsGo.transform.SetParent(canvasGo.transform, false);
+            Image setBg = m_SettingsGo.AddComponent<Image>();
+            setBg.color = new Color(0.02f, 0.03f, 0.06f, 0.92f);
+            setBg.raycastTarget = false;
+            m_SettingsPanelRect = m_SettingsGo.GetComponent<RectTransform>();
+            Place(m_SettingsPanelRect, new Vector2(0f, 1f), new Vector2(0f, 1f),
+                  new Vector2(28f, -200f), new Vector2(380f, settingsPanelH));
+
+            Text setTitle = CreateText(m_SettingsGo.transform, "Title", 18, TextAnchor.UpperLeft,
+                                       new Color(0.72f, 0.90f, 1f, 1f));
+            setTitle.text = "SETTINGS";
+            Place(setTitle.rectTransform, new Vector2(0f, 1f), new Vector2(0f, 1f),
+                  new Vector2(14f, -12f), new Vector2(200f, 26f));
+
+            string[] rowNames = { "Rim Alpha", "Bubble Alpha", "Label Bright", "Link Bright", "Radius Scale", "Gap", "Dust Count" };
+            for (int i = 0; i < GalaxySettings.RowCount; i++)
+            {
+                float y = -46f - i * 34f;
+                m_SettingsNames[i] = CreateText(m_SettingsGo.transform, "N" + i, 15, TextAnchor.UpperLeft,
+                                                new Color(0.75f, 0.85f, 1f, 0.9f));
+                m_SettingsNames[i].text = rowNames[i];
+                Place(m_SettingsNames[i].rectTransform, new Vector2(0f, 1f), new Vector2(0f, 1f),
+                      new Vector2(14f, y), new Vector2(160f, 26f));
+
+                m_SettingsValues[i] = CreateText(m_SettingsGo.transform, "V" + i, 15, TextAnchor.UpperRight,
+                                                 new Color(0.62f, 0.90f, 1f, 0.95f));
+                Place(m_SettingsValues[i].rectTransform, new Vector2(0f, 1f), new Vector2(0f, 1f),
+                      new Vector2(174f, y), new Vector2(86f, 26f));
+
+                CreateButton(m_SettingsGo.transform, "Minus" + i, "-", new Vector2(268f, y + 1f),
+                             new Vector2(26f, 24f), new Color(0.10f, 0.15f, 0.24f, 0.9f),
+                             new Color(0.8f, 0.9f, 1f, 0.95f), out m_StepRects[i, 0]);
+                CreateButton(m_SettingsGo.transform, "Plus" + i, "+", new Vector2(300f, y + 1f),
+                             new Vector2(26f, 24f), new Color(0.10f, 0.15f, 0.24f, 0.9f),
+                             new Color(0.8f, 0.9f, 1f, 0.95f), out m_StepRects[i, 1]);
+            }
+
+            CreateButton(m_SettingsGo.transform, "Apply", "APPLY (REBUILD)", new Vector2(14f, settingsBtnY),
+                         new Vector2(200f, 30f), new Color(0.10f, 0.22f, 0.14f, 0.9f),
+                         new Color(0.6f, 1f, 0.7f, 0.95f), out m_ApplyRect);
+            CreateButton(m_SettingsGo.transform, "CloseBtn", "CLOSE", new Vector2(226f, settingsBtnY),
+                         new Vector2(134f, 30f), new Color(0.16f, 0.10f, 0.10f, 0.9f),
+                         new Color(1f, 0.7f, 0.65f, 0.95f), out m_CloseSettingsRect);
+
+            m_SettingsGo.SetActive(false);
 
             // 详情面板（右上角）：纯色半透明底 + 标题 + 明细
             var panelGo = new GameObject("DetailPanel", typeof(RectTransform));
@@ -119,6 +218,13 @@ namespace Galaxy
                                 new Color(0.55f, 0.66f, 0.82f, 0.85f));
             Place(m_Hint.rectTransform, new Vector2(0f, 0f), new Vector2(0f, 0f),
                   new Vector2(28f, 26f), new Vector2(1100f, 36f));
+
+            // FPS（右下角）：观察大规模星系的实时帧率（性能层决策依据）
+            m_Fps = CreateText(canvasGo.transform, "Fps", 14, TextAnchor.LowerRight,
+                               new Color(0.5f, 0.62f, 0.78f, 0.8f));
+            m_Fps.text = "";
+            Place(m_Fps.rectTransform, new Vector2(1f, 0f), new Vector2(1f, 0f),
+                  new Vector2(-28f, 26f), new Vector2(200f, 30f));
         }
 
         public void SetHeader(string text)
@@ -143,6 +249,94 @@ namespace Galaxy
         public void SetButtonLabel(string text)
         {
             if (m_OpenBtnLabel != null) m_OpenBtnLabel.text = text;
+        }
+
+        /// <summary>右下角 FPS 显示。</summary>
+        public void SetFps(int fps)
+        {
+            if (m_Fps != null) m_Fps.text = "FPS " + fps;
+        }
+
+        // ---- 搜索框 / 设置面板：命中测试 + 状态更新（逻辑在 GalaxySearch/Settings）----
+
+        public bool ContainsSearchBox(Vector2 screenPos) => Hit(m_SearchBoxRect, screenPos);
+        public bool ContainsSettingsButton(Vector2 screenPos) => Hit(m_SettingsBtnRect, screenPos);
+        public bool ContainsSnapshotButton(Vector2 screenPos) => Hit(m_SnapshotBtnRect, screenPos);
+
+        /// <summary>是否落在打开着的设置面板内（用于点击吞掉与相机封锁）。</summary>
+        public bool ContainsSettingsPanel(Vector2 screenPos)
+        {
+            return m_SettingsGo != null && m_SettingsGo.activeSelf && Hit(m_SettingsPanelRect, screenPos);
+        }
+
+        /// <summary>设置面板内的具体按钮命中（返回动作 id："rim-"/"label+"/"apply"/"close"…）。</summary>
+        public bool TryHitSettings(Vector2 screenPos, out string action)
+        {
+            action = null;
+            if (m_SettingsGo == null || !m_SettingsGo.activeSelf) return false;
+            string[] ids = { "rim", "base", "label", "link", "radius", "gap" };
+            for (int i = 0; i < GalaxySettings.RowCount; i++)
+            {
+                if (Hit(m_StepRects[i, 0], screenPos)) { action = ids[i] + "-"; return true; }
+                if (Hit(m_StepRects[i, 1], screenPos)) { action = ids[i] + "+"; return true; }
+            }
+            if (Hit(m_ApplyRect, screenPos)) { action = "apply"; return true; }
+            if (Hit(m_CloseSettingsRect, screenPos)) { action = "close"; return true; }
+            return false;
+        }
+
+        public void SetSearchText(string text, bool active)
+        {
+            if (m_SearchText == null) return;
+            m_SearchText.text = !active ? "SEARCH FILE"
+                                        : (string.IsNullOrEmpty(text) ? "TYPE FILE NAME" : text);
+            m_SearchText.color = active ? new Color(0.9f, 0.95f, 1f, 0.98f)
+                                        : new Color(0.62f, 0.78f, 0.92f, 0.95f);
+        }
+
+        public void SetSearchResults(string text)
+        {
+            if (m_SearchResults != null) m_SearchResults.text = text;
+        }
+
+        public void SetSettingsVisible(bool visible)
+        {
+            if (m_SettingsGo != null) m_SettingsGo.SetActive(visible);
+        }
+
+        public void SetSettingsValues(string[] values)
+        {
+            for (int i = 0; i < GalaxySettings.RowCount && i < values.Length; i++)
+            {
+                if (m_SettingsValues[i] != null) m_SettingsValues[i].text = values[i];
+            }
+        }
+
+        private static bool Hit(RectTransform rt, Vector2 screenPos)
+        {
+            return rt != null && RectTransformUtility.RectangleContainsScreenPoint(rt, screenPos, null);
+        }
+
+        // 通用小按钮：背景图 + 居中文字，一次建齐（命中测试走各自的矩形）
+        private Text CreateButton(Transform parent, string name, string label, Vector2 pos, Vector2 size,
+                                  Color bgColor, Color textColor, out RectTransform rect)
+        {
+            var go = new GameObject(name, typeof(RectTransform));
+            go.transform.SetParent(parent, false);
+            Image bg = go.AddComponent<Image>();
+            bg.color = bgColor;
+            bg.raycastTarget = false;
+            rect = go.GetComponent<RectTransform>();
+            Place(rect, new Vector2(0f, 1f), new Vector2(0f, 1f), pos, size);
+
+            Text text = CreateText(go.transform, "Label", 14, TextAnchor.MiddleCenter, textColor);
+            text.text = label;
+            RectTransform tr = text.rectTransform;
+            tr.anchorMin = Vector2.zero;
+            tr.anchorMax = Vector2.one;
+            tr.offsetMin = Vector2.zero;
+            tr.offsetMax = Vector2.zero;
+            return text;
         }
 
         public void ShowEmpty()

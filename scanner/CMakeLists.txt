@@ -18,6 +18,10 @@ if(WIN32)
     target_link_libraries(galaxy-scan PRIVATE shell32)
 endif()
 
+# 逐文件扫描并行化（std::thread）：MinGW/GCC 需要 -pthread 一类链接选项
+find_package(Threads REQUIRED)
+target_link_libraries(galaxy-scan PRIVATE Threads::Threads)
+
 if(MSVC)
     # /utf-8：源码为 UTF-8（含中文注释），不指定时 MSVC 按本地代码页解析会告警/乱码
     target_compile_options(galaxy-scan PRIVATE /W4 /utf-8)

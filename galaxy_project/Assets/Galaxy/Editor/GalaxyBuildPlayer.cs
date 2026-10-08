@@ -1,5 +1,5 @@
 // ============================================================================
-// 桌面构建（一次性引导，build-rev 9）：检出 %TEMP%\galaxy.build 标记后，设置播放器参数并
+// 桌面构建（一次性引导，build-rev 14）：检出 %TEMP%\galaxy.build 标记后，设置播放器参数并
 // 调 BuildPipeline 产出 Windows 独立应用 —— 与 GalaxyBootstrap 同一套"标记
 // 文件 + 域重载触发"的注入机制（避免对已打开的编辑器起第二个实例抢项目锁）。
 //
@@ -96,7 +96,9 @@ namespace Galaxy.EditorTools
                     "Universal Render Pipeline/Lit",
                     "Sprites/Default",
                     "Galaxy/Bubble",
-                    "Galaxy/OverlayLine");
+                    "Galaxy/OverlayLine",
+                    "Galaxy/StreamLine",
+                    "Galaxy/BlackHoleCore");
 
                 // 模板材质资产（透明 + 不透明两份）：shader_feature 变体（如
                 // _SURFACE_TYPE_TRANSPARENT、_EMISSION）只被"构建内实际引用的

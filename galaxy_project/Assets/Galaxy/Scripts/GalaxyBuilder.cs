@@ -87,13 +87,19 @@ namespace Galaxy
         public float scatteredRadiusScale = 2.6f;
         [Tooltip("散文件宇宙黑洞核心半径 = 该系数 × 文件数³√（视觉包络 = 核心 × 2，" +
                  "布局据此在中心留空）")]
-        public float blackHoleRadiusScale = 0.55f;
+        public float blackHoleRadiusScale = 0.7f;
         [Tooltip("球面基础不透明度（几乎透明：球体只靠菲涅尔边缘光环隐约显形）")]
         public float universeBaseAlpha = 0.005f;
         [Tooltip("边缘光环强度（刻意极低：存在感越弱越好，别抢内容）")]
         public float universeRimAlpha = 0.055f;
         [Tooltip("边缘光环收束指数：越大光环越细")]
         public float universeRimPower = 4.5f;
+
+        [Header("粒子氛围（星尘）")]
+        [Tooltip("星尘基础数量：总数 = 基础 + 每文件追加 × 文件数（clamp 400~8000）")]
+        public int dustBase = 300;
+        [Tooltip("每个文件追加的星尘数量")]
+        public int dustPerFile = 2;
 
         // 无干涉约束（位置投影求解）的轮数上限：它只负责"前置减压"（把互相穿插
         // 的实体尽量推开，减少后续体积收缩的幅度）；实测极限堆积区（全部临界接触）
@@ -110,6 +116,20 @@ namespace Galaxy
         private readonly Dictionary<string, Material> m_PolyhedronMaterials = new Dictionary<string, Material>();
         private readonly Dictionary<string, Material> m_UniverseMaterials = new Dictionary<string, Material>();
         private Material m_BinaryMaterial;   // 二进制红球（单份共享）
+        private GalaxyParticles m_Particles; // 星尘（设置面板实时调数量用）
+
+        // 增量布局状态（上次构建的末态；Rebuild/重扫时按路径匹配复用位置）
+        private Vector3[] m_LastPositions;
+        private string[] m_LastPaths;
+        private string[] m_LastUniverseKeys;
+        private readonly Dictionary<string, Vector3> m_LastCentersByKey = new Dictionary<string, Vector3>();
+
+        /// <summary>星尘组件引用（可能为 null：Build 尚未运行）。</summary>
+        public GalaxyParticles Particles => m_Particles;
+
+        // 名碑引用与基准色（运行时设置面板调亮度用：基准色 × 系数，不丢原色）
+        private readonly List<TextMesh> m_LabelTexts = new List<TextMesh>();
+        private readonly List<Color> m_LabelBaseColors = new List<Color>();
 
         // 运行时创建的网格（原生对象不随 GameObject 销毁自动回收，Rebuild 时显式释放防泄漏）
         private Mesh m_LinksMesh;
@@ -142,6 +162,8 @@ namespace Galaxy
             foreach (Material m in m_UniverseMaterials.Values) DestroyNow(m);
             DestroyNow(m_BinaryMaterial);
             m_BinaryMaterial = null;
+            m_LabelTexts.Clear();
+            m_LabelBaseColors.Clear();
             m_DirMaterials.Clear();
             m_PolyhedronMaterials.Clear();
             m_UniverseMaterials.Clear();
@@ -187,7 +209,14 @@ namespace Galaxy
                 anchorOf = universes.anchorOf,
                 anchorStiffness = universes.anchorStiffness,
             };
-            Vector3[] positions = ForceDirectedLayout.Simulate(graph, universes.seed, layout,
+            // 增量布局：与上次构建按路径匹配，命中节点把"相对旧球心的偏移"平移
+            // 到新球心作种子（球体打包可能微移）；命中过半才启用
+            Vector3[] seeds = universes.seed;
+            if (PrepareIncrementalSeeds(graph, universes, ref seeds, ref layout))
+            {
+                Debug.Log($"[Galaxy] 增量布局：沿用上次位置收敛（迭代降至 {layout.iterations} 轮）");
+            }
+            Vector3[] positions = ForceDirectedLayout.Simulate(graph, seeds, layout,
                                                                galaxyRadius, collisionRadii, ufield);
             int leftoverCollisions = ForceDirectedLayout.ResolveCollisions(positions, collisionRadii, CollisionRounds);
             // PBD 松弛可能把个别节点推出球壁：先收紧回墙内，再由体积自适应按局部
@@ -199,6 +228,9 @@ namespace Galaxy
             int finalViolations = ForceDirectedLayout.CountViolations(positions, collisionRadii);
             sw.Stop();
 
+            // 保存布局状态（供下次构建的增量复用）：位置/路径/宇宙键/球心
+            SaveLayoutState(graph, universes, positions);
+
             var renderers = new MeshRenderer[graph.nodes.Length];
             EntitySpawnResult spawn = SpawnEntities(graph, positions, collisionRadii, shapes, renderers);
 
@@ -207,8 +239,9 @@ namespace Galaxy
             Mesh linksMesh = SpawnLinks(graph, positions, linkVerts, linkColors);
             m_LinksMesh = linksMesh;
 
-            // 多元宇宙：每个第一层文件夹一枚大透明"宇宙球"（菲涅尔边缘光环）
-            int universeCount = SpawnUniverses(universes);
+            // 多元宇宙：每个第一层文件夹一枚大透明"宇宙球"（菲涅尔边缘光环）；
+            // 散文件宇宙中心顺带生成黑洞（吞噬光束需要实体位置与色调）
+            int universeCount = SpawnUniverses(universes, positions, renderers);
 
             // 度数统计：出度 = 引用了多少文件，入度 = 被多少文件引用（HUD 展示用）
             var inDegree = new int[graph.nodes.Length];
@@ -228,6 +261,13 @@ namespace Galaxy
             {
                 maxR = Mathf.Max(maxR, universes.centers[u].magnitude + universes.meshRadii[u]);
             }
+
+            // 粒子氛围：星系尺度的缓慢星尘（纯视觉装饰，随星系重建）；
+            // 数量随文件数增长（大星系更多星尘，参数见 dustBase/dustPerFile）
+            var dustGo = new GameObject("Dust");
+            dustGo.transform.SetParent(transform, false);
+            m_Particles = dustGo.AddComponent<GalaxyParticles>();
+            m_Particles.Configure(maxR, GalaxyParticles.DefaultCount(graph.nodes.Length, dustBase, dustPerFile));
             OrbitCamera orbit = FindAnyObjectByType<OrbitCamera>();
             if (orbit != null) orbit.SetOrbit(Vector3.zero, maxR * 2.8f);
 
@@ -264,26 +304,26 @@ namespace Galaxy
                       $"{spawn.tetraCount} 正四面体 + {graph.nodes.Length - spawn.cubeCount - spawn.tetraCount} 球体 / " +
                       $"{graph.links.Length} 连线 / {universeCount} 宇宙球 / " +
                       $"侵入(松弛后残留 {leftoverCollisions} → 体积自适应后 {finalViolations}) / " +
-                      $"收缩体积 {shrunkCount} 个 / 力导向 {layoutIterations} 轮 {sw.ElapsedMilliseconds} ms / 取景半径 {maxR:F1}");
+                      $"收缩体积 {shrunkCount} 个 / 力导向 {layout.iterations} 轮 {sw.ElapsedMilliseconds} ms / 取景半径 {maxR:F1}");
         }
 
         // ------------------------------------------------------------------
         // 数据路径解析优先级：
         //   1) Inspector 显式指定；
-        //   2) 上次通过 OPEN PROJECT 打开的项目（PlayerPrefs，桌面形态）；
-        //   3) 编辑器：仓库相对路径 scanner/galaxy.json（开发即改即测）；
-        //      构建产物：StreamingAssets 内置演示数据（随包分发）。
+        //   2) 编辑器：仓库演示数据 scanner/galaxy.json —— **跳过 PlayerPrefs**，
+        //      "上次打开的项目"只是构建版用户的特性；编辑器侧 prefs 残留过某次
+        //      对话框扫描的路径，会让自动化重跑加载别数据集（实测踩坑）；
+        //   3) 构建产物：prefs 上次项目（存在才用）→ StreamingAssets 演示数据。
         // ------------------------------------------------------------------
         private string ResolveJsonPath()
         {
             if (!string.IsNullOrEmpty(jsonPath)) return jsonPath;
 
-            string last = PlayerPrefs.GetString("galaxy.lastJson", "");
-            if (!string.IsNullOrEmpty(last) && File.Exists(last)) return last;
-
 #if UNITY_EDITOR
             return Path.GetFullPath(Path.Combine(Application.dataPath, "../../scanner/galaxy.json"));
 #else
+            string last = PlayerPrefs.GetString("galaxy.lastJson", "");
+            if (!string.IsNullOrEmpty(last) && File.Exists(last)) return last;
             return Path.Combine(Application.streamingAssetsPath, "galaxy.json");
 #endif
         }
@@ -711,7 +751,8 @@ namespace Galaxy
         // 深度排序：材质渲染队列排在实体之前（先画球、后画内容）→ 内容永远
         // 叠在球面之上，规避同队列大透明球排序跳变的闪烁。
         // ------------------------------------------------------------------
-        private int SpawnUniverses(UniverseLayout.Result universes)
+        private int SpawnUniverses(UniverseLayout.Result universes, Vector3[] positions,
+                                   MeshRenderer[] renderers)
         {
             var parent = new GameObject("Universes").transform;
             parent.SetParent(transform, false);
@@ -740,7 +781,8 @@ namespace Galaxy
                 if (universes.keys[u] == UniverseLayout.ScatteredKey && universes.innerRadii[u] > 0f)
                 {
                     SpawnBlackHole(parent, universes.centers[u],
-                                   universes.innerRadii[u] / UniverseLayout.BlackHoleEnvelopeFactor);
+                                   universes.innerRadii[u] / UniverseLayout.BlackHoleEnvelopeFactor,
+                                   universes, positions, renderers, u);
                 }
 
                 report.Append($" {universes.keys[u]}({universes.counts[u]}) 半径{universes.meshRadii[u]:F1} " +
@@ -753,14 +795,35 @@ namespace Galaxy
             return universes.keys.Length;
         }
 
-        // 黑洞生成：挂在宇宙球父节点下（与球体/名碑同生命周期）
-        private static void SpawnBlackHole(Transform parent, Vector3 center, float coreRadius)
+        // 黑洞生成：挂在宇宙球父节点下（与球体/名碑同生命周期）。
+        // 顺带收集本宇宙全部实体作为"吞噬光束"的供体（位置 + 实体色调）。
+        private static void SpawnBlackHole(Transform parent, Vector3 center, float coreRadius,
+                                           UniverseLayout.Result universes, Vector3[] positions,
+                                           MeshRenderer[] renderers, int universeIndex)
         {
             if (coreRadius <= 0.01f) return;
+
+            var feederPositions = new List<Vector3>();
+            var feederColors = new List<Color>();
+            for (int i = 0; i < universes.universeOf.Length; i++)
+            {
+                if (universes.universeOf[i] != universeIndex) continue;
+                feederPositions.Add(positions[i]);
+                Color c = Color.white;
+                MeshRenderer r = renderers[i];
+                if (r != null && r.sharedMaterial != null)
+                {
+                    Color em = r.sharedMaterial.GetColor("_EmissionColor");
+                    if (em.maxColorComponent > 0.01f) c = em;
+                }
+                feederColors.Add(c);
+            }
+
             var go = new GameObject("BlackHole");
             go.transform.SetParent(parent, false);
             go.transform.position = center;
-            go.AddComponent<BlackHole>().Build(coreRadius, UniverseTint(UniverseLayout.ScatteredKey));
+            go.AddComponent<BlackHole>().Build(coreRadius, UniverseTint(UniverseLayout.ScatteredKey),
+                                               feederPositions, feederColors);
         }
 
         // 宇宙名碑：球壳外侧悬浮文件夹名（billboard 每帧面向相机；色相 = 球壳色调）。
@@ -768,7 +831,7 @@ namespace Galaxy
         // 只降明度 + 略降透明度），位置在球顶上方 meshRadius + 2.2 处。
         private const float LabelWorldHeight = 2.0f;
 
-        private static void CreateUniverseLabel(Transform parent, string key, Vector3 center, float meshRadius)
+        private void CreateUniverseLabel(Transform parent, string key, Vector3 center, float meshRadius)
         {
             string display = key == UniverseLayout.ScatteredKey ? "scattered" : key;
 
@@ -785,7 +848,10 @@ namespace Galaxy
             tm.alignment = TextAlignment.Center;
             // 名碑亮度：球壳色调降明度（×0.65）+ 略降透明度 —— "看得到但不明显"
             Color tint = UniverseTint(key);
-            tm.color = new Color(tint.r * 0.65f, tint.g * 0.65f, tint.b * 0.65f, 0.85f);
+            Color labelColor = new Color(tint.r * 0.65f, tint.g * 0.65f, tint.b * 0.65f, 0.85f);
+            tm.color = labelColor;
+            m_LabelTexts.Add(tm);
+            m_LabelBaseColors.Add(labelColor);
 
             MeshRenderer mr = go.GetComponent<MeshRenderer>();
             Material fontMat = tm.font != null ? tm.font.material : null;
@@ -910,6 +976,88 @@ namespace Galaxy
             mr.shadowCastingMode = ShadowCastingMode.Off;
             mr.receiveShadows = false;
             return mesh;   // 拾取器持有引用：选择时重建顶点色
+        }
+
+        // ---- 增量布局：状态保存与种子重建 ----
+
+        private void SaveLayoutState(GalaxyGraph graph, UniverseLayout.Result universes, Vector3[] positions)
+        {
+            m_LastPositions = positions;
+            int n = graph.nodes.Length;
+            if (m_LastPaths == null || m_LastPaths.Length != n) m_LastPaths = new string[n];
+            if (m_LastUniverseKeys == null || m_LastUniverseKeys.Length != n) m_LastUniverseKeys = new string[n];
+            for (int i = 0; i < n; i++)
+            {
+                m_LastPaths[i] = graph.nodes[i].path;
+                m_LastUniverseKeys[i] = universes.keys[universes.universeOf[i]];
+            }
+            m_LastCentersByKey.Clear();
+            for (int u = 0; u < universes.keys.Length; u++)
+            {
+                m_LastCentersByKey[universes.keys[u]] = universes.centers[u];
+            }
+        }
+
+        // 命中过半才启用增量（否则视作换了项目，走全量）；命中节点的种子 =
+        // 新球心 + (旧位置 − 旧球心)。自动化每次全新 Play 无历史状态，
+        // 恒走全量路径——确定性不受影响。
+        private bool PrepareIncrementalSeeds(GalaxyGraph graph, UniverseLayout.Result universes,
+                                             ref Vector3[] seeds, ref ForceDirectedLayout.Params layout)
+        {
+            if (m_LastPositions == null || m_LastPaths == null) return false;
+
+            var oldIndexByPath = new Dictionary<string, int>(m_LastPaths.Length);
+            for (int i = 0; i < m_LastPaths.Length; i++) oldIndexByPath[m_LastPaths[i]] = i;
+
+            var newCentersByKey = new Dictionary<string, Vector3>(universes.keys.Length);
+            for (int u = 0; u < universes.keys.Length; u++)
+                newCentersByKey[universes.keys[u]] = universes.centers[u];
+
+            var candidate = (Vector3[])seeds.Clone();
+            int matched = 0;
+            for (int i = 0; i < graph.nodes.Length; i++)
+            {
+                if (!oldIndexByPath.TryGetValue(graph.nodes[i].path, out int old)) continue;
+                if (old >= m_LastPositions.Length || old >= m_LastUniverseKeys.Length) continue;
+                string oldKey = m_LastUniverseKeys[old];
+                if (!m_LastCentersByKey.TryGetValue(oldKey, out Vector3 oldCenter)) continue;
+                if (!newCentersByKey.TryGetValue(oldKey, out Vector3 newCenter)) continue;
+                candidate[i] = newCenter + (m_LastPositions[old] - oldCenter);
+                matched++;
+            }
+
+            if (matched < 16 || matched * 2 < graph.nodes.Length) return false;
+
+            seeds = candidate;
+            layout.iterations = Mathf.Min(layout.iterations, 90);
+            layout.startTemperature = Mathf.Min(layout.startTemperature, 1.5f);
+            return true;
+        }
+
+        // ---- 运行时外观调节（设置面板调用）：只改材质/颜色实例，不动字段原值 ----
+
+        /// <summary>宇宙球壳亮度（散文件宇宙沿用派生风格：更实的底 + 更弱的光环）。</summary>
+        public void ApplyUniverseAppearance(float baseAlpha, float rimAlpha)
+        {
+            foreach (KeyValuePair<string, Material> pair in m_UniverseMaterials)
+            {
+                Material mat = pair.Value;
+                if (mat == null) continue;
+                bool scattered = pair.Key == UniverseLayout.ScatteredKey;
+                mat.SetFloat("_BaseAlpha", scattered ? baseAlpha * 2.5f : baseAlpha);
+                mat.SetFloat("_RimAlpha", scattered ? rimAlpha * 0.9f : rimAlpha);
+            }
+        }
+
+        /// <summary>名碑亮度系数（基准色 × 系数）。</summary>
+        public void ApplyLabelBrightness(float factor)
+        {
+            for (int i = 0; i < m_LabelTexts.Count; i++)
+            {
+                if (m_LabelTexts[i] == null) continue;
+                Color c = m_LabelBaseColors[i];
+                m_LabelTexts[i].color = new Color(c.r * factor, c.g * factor, c.b * factor, c.a);
+            }
         }
 
         // Destroy 是运行时 API（延迟到帧末销毁）；编辑模式必须用 DestroyImmediate。

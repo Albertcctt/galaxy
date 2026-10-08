@@ -100,6 +100,18 @@ namespace Galaxy.EditorTools
 
             if (s_Phase == 2 && s_Frames >= s_MarkFrame + 45)
             {
+                // 设置面板冒烟（安排在截图之后：APPLY 会重建星系并清掉选中态）；
+                // 护栏：回调里未捕获异常会中断相位机并逐帧刷屏（铁律）
+                try
+                {
+                    GalaxyPicker smokePicker = Object.FindAnyObjectByType<GalaxyPicker>();
+                    if (smokePicker != null) smokePicker.DebugSmokeSettings();
+                }
+                catch (System.Exception e)
+                {
+                    Debug.LogError($"[GalaxyAutoPlay] 设置冒烟异常: {e}");
+                }
+
                 Debug.Log($"[GalaxyAutoPlay] 截图流程结束（全景 {File.Exists(ShotPath)} / 选中态 " +
                           $"{File.Exists(ShotPathSelected)}），保持 Play 供查看");
                 SessionState.SetBool(SessionKey, false);
@@ -137,6 +149,35 @@ namespace Galaxy.EditorTools
             // 模拟"双击打开"：走与交互完全相同的入口打开代码查看器（截图可验证）
             picker.OpenViewer(hub);
             Debug.Log("[GalaxyAutoPlay] 已打开代码查看器（模拟双击枢纽文件）");
+
+            // 搜索定位抽查：直接调用匹配纯函数（不经 UI 状态），验证文件名定位链路
+            var matches = GalaxySearch.Match(picker.Data.graph, "lv_conf");
+            var names = new System.Text.StringBuilder();
+            for (int i = 0; i < matches.Count && i < 3; i++)
+            {
+                names.Append(picker.Data.graph.nodes[matches[i]].name).Append("  ");
+            }
+            Debug.Log($"[GalaxyAutoPlay] 搜索抽查 'lv_conf' -> {matches.Count} 命中: {names}");
+
+            // include 跳转抽查：枢纽的一条出边按目标路径文本反向解析，应命中同一目标
+            for (int e = 0; e < picker.Data.graph.links.Length; e++)
+            {
+                if (picker.Data.graph.links[e].source != hub) continue;
+                int target = picker.Data.graph.links[e].target;
+                string includeText = picker.Data.graph.nodes[target].path;
+                int resolved = picker.ResolveInclude(hub, includeText);
+                Debug.Log($"[GalaxyAutoPlay] include 跳转抽查: '{includeText}' -> #{resolved}" +
+                          $"（期望 #{target}）{(resolved == target ? " OK" : " FAIL")}");
+                break;
+            }
+
+            // 黑洞特写定位（自动截图裁剪用）：投影到屏幕坐标
+            BlackHole blackHole = Object.FindAnyObjectByType<BlackHole>();
+            if (blackHole != null)
+            {
+                Vector3 bhScreen = cam.WorldToScreenPoint(blackHole.transform.position);
+                Debug.Log($"[GalaxyAutoPlay] 黑洞投影 ({bhScreen.x:F0},{bhScreen.y:F0})");
+            }
         }
     }
 }

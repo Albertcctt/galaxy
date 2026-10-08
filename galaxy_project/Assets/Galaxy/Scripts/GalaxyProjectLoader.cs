@@ -47,10 +47,14 @@ namespace Galaxy
         private bool m_PendingPersist;
         private readonly StringBuilder m_Out = new StringBuilder();
         private readonly StringBuilder m_Err = new StringBuilder();
+        private readonly object m_OutLock = new object();
+        private readonly object m_ErrLock = new object();
+        private volatile string m_ProgressText = "";   // 扫描器进度行（"[progress] a/b" 的 "a/b"）
 
-        // 渲染体量上限：布局是 O(n²)，超出后重建会长时间冻结应用（实测教训：
-        // 用户错选"仓库总仓"目录，扫描器在被拒之前先把几万文件扫了几个小时）。
-        private const int MaxRenderableNodes = 10000;
+        // 渲染体量上限：布局引擎已升级（Barnes-Hut + 网格化，近线性），上限从
+        // 1 万抬到 4 万；仍设上限是因为超大规模时实体网格构建与逐对象渲染
+        //（未走实例化）也会成为瓶颈。
+        private const int MaxRenderableNodes = 40000;
 
         /// <summary>是否有流程在跑（对话框打开中 / 扫描中）。</summary>
         public bool IsBusy => m_State != State.Idle;
@@ -107,6 +111,7 @@ namespace Galaxy
                     StandardOutputEncoding = Encoding.UTF8,
                 };
                 m_Process = Process.Start(psi);
+                AttachOutputCapture(m_Process);
                 m_State = State.DialogOpen;
                 SetStatus("Selecting folder ...");
             }
@@ -156,11 +161,13 @@ namespace Galaxy
                     StandardErrorEncoding = Encoding.UTF8,
                 };
                 m_Process = Process.Start(psi);
+                AttachOutputCapture(m_Process);
                 m_State = State.Scanning;
                 m_Cancelled = false;
                 m_ScanFolder = folder;
                 m_ScanStart = Time.realtimeSinceStartup;
                 m_NextStatusTick = 0f;
+                m_ProgressText = "";
                 SetStatus($"Scanning {folder} ...");
                 SetButtonLabel("CANCEL SCAN");
                 Debug.Log($"[Galaxy] 开始扫描: {folder} -> {m_PendingFolder}");
@@ -173,26 +180,64 @@ namespace Galaxy
         }
 
         // ------------------------------------------------------------------
+        // 进程输出异步捕获：扫描器现在持续输出进度行（每 0.5s 一行），
+        // 若不边跑边收会把管道缓冲写满导致子进程写阻塞（死锁）。异步事件在
+        // 后台线程追加到缓冲；结束后用"参数不带时间的 WaitForExit()"等事件排干
+        //（.NET 文档语义），再读缓冲。
+        // ------------------------------------------------------------------
+        private void AttachOutputCapture(Process process)
+        {
+            process.OutputDataReceived += (_, e) =>
+            {
+                if (e.Data == null) return;
+                if (e.Data.StartsWith("[progress] "))
+                {
+                    m_ProgressText = e.Data.Substring(11).Trim();
+                }
+                lock (m_OutLock) { m_Out.AppendLine(e.Data); }
+            };
+            process.ErrorDataReceived += (_, e) =>
+            {
+                if (e.Data == null) return;
+                lock (m_ErrLock) { m_Err.AppendLine(e.Data); }
+            };
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+        }
+
+        // ------------------------------------------------------------------
         // 进程轮询：对话框退出 → 解析路径 → 扫描；扫描退出 → 重建
         // ------------------------------------------------------------------
         private void Update()
         {
             if (m_State == State.Idle || m_Process == null) return;
 
-            // 扫描中：状态行实时走秒（"看起来卡死"的观感来自状态栏一动不动 ——
-            // 实测教训：用户选到巨型目录后无从判断是在工作还是已挂）
+            // 扫描中：状态行实时刷新 —— 有进度行时显示真实百分比，否则退回走秒
             if (m_State == State.Scanning && Time.realtimeSinceStartup >= m_NextStatusTick)
             {
                 m_NextStatusTick = Time.realtimeSinceStartup + 0.25f;
-                SetStatus($"Scanning {m_ScanFolder} · {Time.realtimeSinceStartup - m_ScanStart:F0}s " +
-                          "(CANCEL SCAN to abort)");
+                string progress = m_ProgressText;
+                string pct = "";
+                if (!string.IsNullOrEmpty(progress))
+                {
+                    int slash = progress.IndexOf('/');
+                    if (slash > 0 &&
+                        long.TryParse(progress.Substring(0, slash), out long doneN) &&
+                        long.TryParse(progress.Substring(slash + 1), out long totalN) && totalN > 0)
+                    {
+                        pct = $" · {doneN * 100 / totalN}% ({doneN}/{totalN})";
+                    }
+                }
+                SetStatus($"Scanning {m_ScanFolder}{pct} · " +
+                          $"{Time.realtimeSinceStartup - m_ScanStart:F0}s (CANCEL SCAN to abort)");
             }
 
             if (!m_Process.HasExited) return;
 
-            m_Process.WaitForExit();   // 收尾（此时输出已完整）
-            string stdout = m_Process.StandardOutput.ReadToEnd();
-            string stderr = m_Process.StandardError.ReadToEnd();
+            m_Process.WaitForExit();   // 不带参数的二次等待：确保异步输出事件已排干
+            string stdout, stderr;
+            lock (m_OutLock) stdout = m_Out.ToString();
+            lock (m_ErrLock) stderr = m_Err.ToString();
             int exit = m_Process.ExitCode;
             m_Process.Dispose();
             m_Process = null;

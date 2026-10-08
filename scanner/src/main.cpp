@@ -27,7 +27,7 @@
 namespace galaxy {
 namespace {
 
-constexpr const char* kScannerId = "galaxy-scan/0.2.0";
+constexpr const char* kScannerId = "galaxy-scan/0.3.0";
 constexpr uint64_t kSchemaVersion = 1;  // 契约版本：Unity 端遇到更高版本应拒绝加载
 
 struct CliOptions {

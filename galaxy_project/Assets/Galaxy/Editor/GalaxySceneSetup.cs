@@ -44,6 +44,10 @@ namespace Galaxy.EditorTools
             // 场景实例的参数是序列化存储的：改 C# 默认值不会影响已存在的实例。
             // 每次装配时统一同步为"代码默认值"，让代码成为唯一事实来源。
             SyncBuilderDefaults(builder);
+            // 非交互装配（自动化/引导）：把 jsonPath 钉死为空 —— 解析链回落
+            // 到"编辑器→仓库演示数据"，避免场景里残留的路径（如某次编辑器内
+            // 对话框扫描写回的 jsonPath）让自动化跑在别的数据集上（实测踩坑）
+            if (!interactive) builder.jsonPath = "";
 
             // 2) 主相机 + OrbitCamera + 深空底色
             Camera cam = Camera.main;
@@ -105,6 +109,8 @@ namespace Galaxy.EditorTools
                 target.universeBaseAlpha    = probe.universeBaseAlpha;
                 target.universeRimAlpha     = probe.universeRimAlpha;
                 target.universeRimPower     = probe.universeRimPower;
+                target.dustBase             = probe.dustBase;
+                target.dustPerFile          = probe.dustPerFile;
             }
             finally
             {

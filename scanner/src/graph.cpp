@@ -1,11 +1,16 @@
 #include "graph.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <fstream>
+#include <iostream>
 #include <map>
 #include <sstream>
 #include <system_error>
+#include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "include_scanner.h"
 #include "util.h"
@@ -79,31 +84,86 @@ Graph build_graph(const fs::path& root, const std::vector<SourceFile>& files,
         inc_rel.push_back(rel);
     }
 
-    // ---- 第 2 遍：逐文件嗅探文本/二进制；文本数行（C 家族再抽 include）----
-    // 边先经 map 去重并累计权重（同一对文件多次 include 合并为一条带 weight 的边）。
+    // ---- 第 2 遍（并行读阶段）：逐文件嗅探文本/二进制；文本数行、抽 include ----
+    // 每个文件的读取/解析彼此独立，可按文件并行；但"解析 include 成边"要落在
+    // 确定顺序上（见下方串行阶段）——并行与确定性分工：计算并行、归约串行。
+    // C++ 视角：fork-join 的 map 阶段并行、reduce 阶段单线程，输出与串行版
+    // 逐字节一致（可用旧产物 diff 验证）。
+    struct ScanOut {
+        std::string kind;                  // "text" / "binary" / ""（读失败）
+        uint32_t lines = 0;
+        std::vector<IncludeRef> includes;  // C 家族抽出的 include（未解析）
+    };
+    std::vector<ScanOut> scanned(files.size());
+
+    const size_t total = files.size();
+    std::atomic<size_t> next{0};
+    std::atomic<size_t> done{0};
+
+    // 进度线程：每 0.5s 输出一行 "[progress] done/total"（stdout 唯一写者，
+    // 不与环境中的最终汇总竞争；前端（Unity 应用）解析该行显示实时百分比）
+    std::atomic<bool> finished{false};
+    std::thread reporter([&]() {
+        while (!finished.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            const size_t d = done.load(std::memory_order_relaxed);
+            if (d < total) {
+                std::cout << "[progress] " << d << "/" << total << std::endl;
+            }
+        }
+    });
+
+    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned thread_count = static_cast<unsigned>(std::min<size_t>(hw, total == 0 ? 1 : total));
+    auto worker = [&]() {
+        for (;;) {
+            const size_t i = next.fetch_add(1, std::memory_order_relaxed);
+            if (i >= total) break;
+            const SourceFile& f = files[i];
+            ScanOut& out = scanned[i];
+
+            std::string head;
+            if (!read_head(f.abs, head, 8192)) {
+                done.fetch_add(1, std::memory_order_relaxed);
+                continue;   // 读不了（竞态删除）：留空节点
+            }
+            if (is_binary_head(head)) {
+                out.kind = "binary";
+                done.fetch_add(1, std::memory_order_relaxed);
+                continue;   // 二进制：不数行、不抽依赖
+            }
+            out.kind = "text";
+            if (f.bytes > opt.max_line_count_bytes) {
+                done.fetch_add(1, std::memory_order_relaxed);
+                continue;   // 巨型文本：保留节点但跳过全量读
+            }
+
+            std::string src;
+            if (!read_file(f.abs, src)) {
+                done.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            out.lines = count_lines(src);
+            if (f.c_family) out.includes = scan_includes(src);
+            done.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+
+    std::vector<std::thread> pool;
+    pool.reserve(thread_count);
+    for (unsigned t = 0; t < thread_count; ++t) pool.emplace_back(worker);
+    for (auto& t : pool) t.join();
+    finished.store(true, std::memory_order_relaxed);
+    reporter.join();
+
+    // ---- 第 2 遍（串行归约）：按文件序 + include 序解析成边 ----
+    // 顺序与旧版逐文件串行完全一致 => 输出确定性；map 去重累计权重不变。
     std::map<std::pair<uint32_t, uint32_t>, uint32_t> edge_weight;
     for (size_t id = 0; id < files.size(); ++id) {
-        const SourceFile& f = files[id];
-        Node& node = g.nodes[id];
+        g.nodes[id].kind = scanned[id].kind;
+        g.nodes[id].lines = scanned[id].lines;
 
-        // 文本/二进制嗅探（所有文件都做，只读头部 8KB）
-        std::string head;
-        if (!read_head(f.abs, head, 8192)) continue;   // 读不了（竞态删除）：留空节点
-        const bool binary = is_binary_head(head);
-        node.kind = binary ? "binary" : "text";
-        if (binary) continue;   // 二进制：不数行、不抽依赖（查看器也不该打开）
-
-        // 巨型文本：保留节点但跳过全量读（行数 0；C 家族的 include 也放弃 ——
-        // 原实现对这类生成文件同样是跳过，只是现在还保留节点以示存在）
-        if (f.bytes > opt.max_line_count_bytes) continue;
-
-        std::string src;
-        if (!read_file(f.abs, src)) continue;
-        node.lines = count_lines(src);
-
-        if (!f.c_family) continue;   // 非 C 文本：本版只做节点，不抽依赖
-
-        for (const IncludeRef& ref : scan_includes(src)) {
+        for (const IncludeRef& ref : scanned[id].includes) {
             const fs::path target = from_utf8(ref.target);
             uint32_t dst = UINT32_MAX;
             // 解析顺序（简化版编译器行为）：

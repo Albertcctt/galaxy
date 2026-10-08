@@ -25,10 +25,12 @@
 // ============================================================================
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Text;
 using UnityEngine;
 using UnityEngine.UI;
+using Debug = UnityEngine.Debug;   // 消除与 System.Diagnostics.Debug 的二义性
 
 namespace Galaxy
 {
@@ -72,12 +74,15 @@ namespace Galaxy
         private RectTransform m_BodyRect;
         private RectTransform m_CloseRect;
         private RectTransform m_TrackRect;   // 滚动条命中区（不可见，宽 14；按下/拖拽 = 擦洗直达）
+        private RectTransform m_VsCodeRect;  // "VS CODE" 按钮命中区（外部编辑器打开）
         private Text m_Title;
         private Text m_Subtitle;
         private Text m_Gutter;
         private Text m_Code;
         private Image m_ScrollThumb;
         private bool m_ScrubActive;          // 正在拖拽滚动条（期间相机输入整体让位）
+        private string m_FileFullPath = "";  // 当前文件绝对路径（外部编辑器打开用）
+        private int m_NodeIndex = -1;        // 当前文件在图中的节点下标（include 跳转解析用）
 
         private string[] m_Lines = Array.Empty<string>();
         private bool[] m_State = Array.Empty<bool>();   // 每行起始处是否处于块注释中
@@ -96,9 +101,10 @@ namespace Galaxy
         // ------------------------------------------------------------------
 
         /// <summary>打开文件并渲染窗口（root = 扫描根目录，node.path 为相对路径）。</summary>
-        public void Show(string rootPath, GalaxyNode node)
+        public void Show(string rootPath, GalaxyNode node, int nodeIndex)
         {
             EnsureCreated();
+            m_NodeIndex = nodeIndex;
             m_CanvasRoot.SetActive(true);
             m_Title.text = node.name;
             m_Subtitle.text = node.path;
@@ -115,6 +121,7 @@ namespace Galaxy
             {
                 // 二进制文件：拒绝读取（读出的是乱码）—— 面板显示说明
                 //（星系里这些实体是红色球，这里给文字层面的确认）
+                m_FileFullPath = "";
                 m_Lines = new[]
                 {
                     "Binary file — preview not available.",
@@ -128,11 +135,13 @@ namespace Galaxy
                 try
                 {
                     string full = Path.Combine(rootPath ?? "", node.path ?? "");
+                    m_FileFullPath = full;   // 外部 VS Code 打开用
                     m_Lines = File.ReadAllLines(full);   // 自动处理 \r\n 与 BOM
                     m_State = ComputeBlockState(m_Lines);
                 }
                 catch (Exception e)
                 {
+                    m_FileFullPath = "";
                     m_Lines = new[] { "Cannot open file: " + e.Message };
                     m_State = new[] { false };
                 }
@@ -164,6 +173,76 @@ namespace Galaxy
         public bool IsOverClose(Vector2 screenPos)
         {
             return IsOpen && RectTransformUtility.RectangleContainsScreenPoint(m_CloseRect, screenPos, null);
+        }
+
+        /// <summary>屏幕点是否落在 VS CODE 按钮上。</summary>
+        public bool IsOverVsCode(Vector2 screenPos)
+        {
+            return IsOpen && RectTransformUtility.RectangleContainsScreenPoint(m_VsCodeRect, screenPos, null);
+        }
+
+        /// <summary>
+        /// 代码区点击命中测试：点在代码区且命中一行 #include 时，解析出目标节点
+        /// 下标（-1 = 不是可跳转的 include 行）。走查：屏幕点 → 代码矩形局部坐标
+        /// → 行号（按行高折算）→ 抽取 include 文本 → 图内出边解析。
+        /// </summary>
+        public int HitTestIncludeLine(Vector2 screenPos)
+        {
+            if (!IsOpen || m_Code == null) return -1;
+            if (!RectTransformUtility.RectangleContainsScreenPoint(m_Code.rectTransform, screenPos, null)) return -1;
+            if (!RectTransformUtility.ScreenPointToLocalPointInRectangle(
+                    m_Code.rectTransform, screenPos, null, out Vector2 local)) return -1;
+
+            // m_Code 的 pivot = (0,1)：local.y 自顶向下为负；行号 = 窗口首行 + 第 n 行
+            int row = Mathf.FloorToInt(-local.y / m_LineStride);
+            int line = m_FirstLine + row;
+            if (line < 0 || line >= m_Lines.Length) return -1;
+
+            string include = ExtractIncludeTarget(m_Lines[line]);
+            if (include == null) return -1;
+
+            GalaxyPicker picker = GetComponent<GalaxyPicker>();
+            return picker != null ? picker.ResolveInclude(m_NodeIndex, include) : -1;
+        }
+
+        // 从一行代码里抽取 include 目标文本（#include <x.h> / #include "x.h"）；无则 null
+        private static string ExtractIncludeTarget(string line)
+        {
+            int h = line.IndexOf('#');
+            if (h < 0) return null;
+            int inc = line.IndexOf("include", h + 1, StringComparison.Ordinal);
+            if (inc < 0) return null;
+            int i = inc + 7;
+            while (i < line.Length && (line[i] == ' ' || line[i] == '\t')) i++;
+            if (i >= line.Length) return null;
+            char open = line[i];
+            char close = open == '<' ? '>' : open == '"' ? '"' : '\0';
+            if (close == '\0') return null;
+            int end = line.IndexOf(close, i + 1);
+            if (end < 0) return null;
+            return line.Substring(i + 1, end - i - 1);
+        }
+
+        /// <summary>在外部 VS Code 中打开当前文件（cmd /c code "path"；失败仅告警）。</summary>
+        public void OpenInVsCode()
+        {
+            if (string.IsNullOrEmpty(m_FileFullPath)) return;
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "cmd.exe",
+                    Arguments = "/c code \"" + m_FileFullPath + "\"",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                };
+                Process.Start(psi);
+                Debug.Log($"[CodeViewer] 已在外部 VS Code 打开: {m_FileFullPath}");
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[CodeViewer] 调起 VS Code 失败: {e.Message}");
+            }
         }
 
         /// <summary>滚轮滚动（仅当指针悬停面板上）。返回是否消费了本次滚动。</summary>
@@ -479,6 +558,14 @@ namespace Galaxy
             m_CloseRect = close.rectTransform;
             Place(m_CloseRect, new Vector2(1f, 1f), new Vector2(1f, 1f),
                   new Vector2(-10f, -3f), new Vector2(30f, 30f));
+
+            // "VS CODE" 按钮：调起外部编辑器打开当前文件（桌面工作流的标配出口）
+            Text vs = CreateText(titleGo.transform, "VsCode", 13, TextAnchor.MiddleCenter,
+                                 new Color(0.55f, 0.75f, 0.9f, 0.9f), mono);
+            vs.text = "VS CODE";
+            m_VsCodeRect = vs.rectTransform;
+            Place(m_VsCodeRect, new Vector2(1f, 1f), new Vector2(1f, 1f),
+                  new Vector2(-48f, -6f), new Vector2(76f, 24f));
 
             // 正文区（RectMask2D：窗口文本永远不越出面板）+ 行号槽 + 代码 + 滚动条
             var bodyGo = new GameObject("Body", typeof(RectTransform));

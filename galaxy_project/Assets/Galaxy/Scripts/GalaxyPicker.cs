@@ -72,6 +72,8 @@ namespace Galaxy
         // 增亮倍率对 Bloom 敏感：过高时枢纽核心（数百条高亮线 + 大量邻接实体）
         // 会过曝成白团、金色链与光晕全部被吞掉（实测 1.55/2.40 的失败形态）。
         private const float NeighborBoost = 1.30f;   // 邻接实体：自发光增强倍率
+        private const float HoverEmission = 1.15f;   // 悬停预览：自发光临时提升（介于压暗与邻接之间）
+        private const float FocusMinDistance = 14f;  // 视点引导的最小推近距离（相机不会贴脸）
         private const float SelectedBoost = 1.90f;   // 选中实体：自发光增强倍率
         // 多面体填充是半透明的（α≈0.12）：点亮时把透明度提上来（自发光会被
         // alpha 缩水，不提透明度等于没点亮——实测"立方体点亮后亮度不够"的成因）
@@ -81,12 +83,16 @@ namespace Galaxy
         private const float EdgeDim = 0.18f;                 // 非关联棱线：压暗系数（含 alpha）
         private const float EdgeNeighborAlpha = 0.8f;        // 邻接棱线：透明度（默认 0.5 → 0.8）
 
-        private static readonly Color HighlightColor = new Color(1f, 0.84f, 0.38f, 1f);
-        private static readonly Color HighlightColorFar = new Color(1f, 0.84f, 0.38f, 0.45f);
+        // 依赖方向双色：金 = "被引用"（他人 → 我），青 = "引用了"（我 → 他人）
+        // ——高亮链两端一眼读出依赖方向（点击查看器的 #include 行还能直接跳转）
+        private static readonly Color HighlightColor = new Color(1f, 0.84f, 0.38f, 1f);        // 被引用（近端）
+        private static readonly Color HighlightColorFar = new Color(1f, 0.84f, 0.38f, 0.45f);   // 被引用（远端）
+        private static readonly Color HighlightOutgoing = new Color(0.42f, 0.95f, 0.85f, 1f);   // 引用了（近端）
+        private static readonly Color HighlightOutgoingFar = new Color(0.42f, 0.95f, 0.85f, 0.45f);  // 引用了（远端）
         private static readonly Color EdgeSelectedColor = new Color(1f, 0.84f, 0.38f, 0.95f);   // 选中多面体棱线 = 金框
 
-        private const string HintIdle = "Left-click: file details · Double-click: open file · Drag: orbit · Wheel: zoom · Right-drag: pan";
-        private const string HintSelected = "Click again or click empty space to deselect";
+        private const string HintIdle = "Left-click: details · Double-click: open file · Esc: back · Drag: orbit · Wheel: zoom · Right-drag: pan";
+        private const string HintSelected = "Gold: referenced by · Teal: includes · Click #include to jump · Esc/empty: deselect";
 
         private SceneData m_Data;
         private Transform m_Root;
@@ -109,15 +115,23 @@ namespace Galaxy
         private MeshRenderer m_OverlayRenderer;
         private readonly List<Vector3> m_OverlayVerts = new List<Vector3>();
         private readonly List<Color> m_OverlayColors = new List<Color>();
+        private readonly List<Vector2> m_OverlayUvs = new List<Vector2>();   // 流光：uv.x=沿链长度（源端 0）
 
         private GalaxyHud m_Hud;
         private GalaxyCodeViewer m_Viewer;           // 代码查看器（双击路径懒创建，与 HUD 同挂相机）
         private GalaxyProjectLoader m_Loader;        // 项目加载器（OPEN PROJECT 按钮 / --scan）
+        private GalaxySearch m_Search;               // 搜索定位（搜索框点击懒创建）
+        private GalaxySettings m_Settings;           // 设置面板（SETTINGS 按钮懒创建）
+        private OrbitCamera m_Orbit;                 // 视点引导（选中/搜索跳转时聚焦）
         private bool m_Pressed;
         private Vector2 m_PressPos;
         private int m_LastClickHit = -1;             // 上一次点击命中的实体（双击判定）
         private float m_LastClickTime = -10f;
         private bool m_ViewerScrubbing;              // 正在拖拽查看器滚动条（整段手势拦截）
+        private int m_Hover = -1;                    // 悬停预览命中的实体（-1 = 无）
+        private float m_LinkBrightness = 1f;         // 连线亮度系数（设置面板；高亮金线不受影响）
+        private float m_FpsAccum;                    // FPS 统计窗口
+        private int m_FpsFrames;
 
         // 指针在 UI 面板上时，相机输入（拖拽/滚轮）让位给面板操作
         private void OnEnable() { OrbitCamera.PointerBlocked = IsPointerOverPanel; }
@@ -137,7 +151,8 @@ namespace Galaxy
             // 面板范围内、或正在拖拽滚动条（拖出面板也保持封锁）→ 相机让位
             if (m_Viewer != null && m_Viewer.IsOpen &&
                 (m_Viewer.ContainsScreenPoint(screenPos) || m_Viewer.IsScrubbing)) return true;
-            return m_Hud != null && m_Hud.ContainsScreenPoint(screenPos);
+            if (m_Hud == null) return false;
+            return m_Hud.ContainsScreenPoint(screenPos) || m_Hud.ContainsSettingsPanel(screenPos);
         }
 
         /// <summary>被引用最多的文件（枢纽节点）；-1 = 无数据。自动化演示与将来"引导视角"用。</summary>
@@ -162,6 +177,8 @@ namespace Galaxy
             m_Data = data;
             m_Root = galaxyRoot;
             m_Selected = -1;
+            m_Hover = -1;
+            m_Orbit = FindAnyObjectByType<OrbitCamera>();
             m_Neighbors.Clear();
 
             int n = data.positions.Length;
@@ -275,6 +292,14 @@ namespace Galaxy
             RebuildEdgeColors();
             RebuildOverlay();
 
+            // 视点引导：把镜头平滑带到选中天体（只收拢不拉远 —— 用户自己在远景
+            // 浏览时逐次点选，星系会缓缓"跟手"聚到眼前）
+            if (m_Orbit != null)
+            {
+                m_Orbit.FocusOn(m_Data.positions[index],
+                                Mathf.Max(m_Data.radii[index] * 15f, FocusMinDistance));
+            }
+
             if (Application.isPlaying)
             {
                 EnsureHud();
@@ -317,12 +342,47 @@ namespace Galaxy
             if (m_Data == null) return;
             Mouse mouse = Mouse.current;
             if (mouse == null) return;
+            Vector2 mousePos = mouse.position.ReadValue();
+
+            // FPS 统计（0.5s 平滑；重负载阻塞期本回调不运行、天然不计入）
+            m_FpsAccum += Time.unscaledDeltaTime;
+            m_FpsFrames++;
+            if (m_FpsAccum >= 0.5f)
+            {
+                if (m_Hud != null) m_Hud.SetFps(Mathf.RoundToInt(m_FpsFrames / m_FpsAccum));
+                m_FpsAccum = 0f;
+                m_FpsFrames = 0;
+            }
+
+            // Esc：按 搜索 → 查看器 → 选中 的优先序逐级退出
+            Keyboard kb = Keyboard.current;
+            if (kb != null && kb.escapeKey.wasPressedThisFrame)
+            {
+                if (m_Search != null && m_Search.IsActive) { m_Search.Deactivate(); return; }
+                if (m_Viewer != null && m_Viewer.IsOpen) { m_Viewer.Close(); return; }
+                if (m_Selected >= 0) { ClearSelection(); return; }
+            }
+
+            // 悬停预览：指针不在任何面板上、且没在拖拽时，每帧求一次射线
+            //（O(n) 射线-球求交，微秒级；命中的实体自发光临时提亮一档）
+            int hover = -1;
+            if (!mouse.leftButton.isPressed && !mouse.rightButton.isPressed &&
+                !IsPointerOverPanel(mousePos))
+            {
+                hover = PickAt(mousePos);
+            }
+            if (hover != m_Hover)
+            {
+                if (m_Hover >= 0 && m_Hover < m_Data.renderers.Length) ApplySingleEntity(m_Hover);
+                m_Hover = hover;
+                if (hover >= 0 && hover != m_Selected) ApplyHover(hover);
+            }
 
             // 滚轮：指针悬停代码查看器上时翻页（虚拟窗口滚动）
             float wheel = mouse.scroll.ReadValue().y;
             if (Mathf.Abs(wheel) > 0.01f && m_Viewer != null && m_Viewer.IsOpen)
             {
-                m_Viewer.TryScroll(mouse.position.ReadValue(), wheel);
+                m_Viewer.TryScroll(mousePos, wheel);
             }
 
             if (mouse.leftButton.wasPressedThisFrame)
@@ -361,10 +421,18 @@ namespace Galaxy
             Vector2 pos = mouse.position.ReadValue();
             if (Vector2.Distance(pos, m_PressPos) > ClickSlopPixels) return;   // 拖拽 = 旋转相机
 
-            // 代码查看器优先拦截：关闭按钮 → 关面板；面板内部 → 吞掉（不改变选中）
+            // 代码查看器优先拦截：关闭 / VS CODE / include 跳转 / 面板内部
             if (m_Viewer != null && m_Viewer.IsOpen)
             {
                 if (m_Viewer.IsOverClose(pos)) { m_Viewer.Close(); return; }
+                if (m_Viewer.IsOverVsCode(pos)) { m_Viewer.OpenInVsCode(); return; }
+                int jump = m_Viewer.HitTestIncludeLine(pos);
+                if (jump >= 0)
+                {
+                    SelectNode(jump);     // 选中 + 视点引导（相机飞向被引用的文件）
+                    OpenViewer(jump);     // 查看器切到目标文件 —— 读代码沿依赖走图
+                    return;
+                }
                 if (m_Viewer.ContainsScreenPoint(pos)) return;
             }
             // OPEN PROJECT 按钮（标题下方）：空闲 → 系统文件夹对话框；
@@ -376,6 +444,35 @@ namespace Galaxy
                 else m_Loader.OpenDialog();
                 return;
             }
+            // 搜索框 / SETTINGS / SNAPSHOT / 设置面板
+            if (m_Hud != null && m_Hud.ContainsSearchBox(pos))
+            {
+                EnsureSearch();
+                m_Search.Activate();
+                return;
+            }
+            if (m_Hud != null && m_Hud.ContainsSettingsButton(pos))
+            {
+                EnsureSettings();
+                m_Settings.Toggle();
+                return;
+            }
+            if (m_Hud != null && m_Hud.ContainsSnapshotButton(pos))
+            {
+                CaptureSnapshot();
+                return;
+            }
+            if (m_Hud != null && m_Hud.ContainsSettingsPanel(pos))
+            {
+                if (m_Hud.TryHitSettings(pos, out string cfgAction))
+                {
+                    EnsureSettings();
+                    m_Settings.Handle(cfgAction);
+                }
+                return;   // 面板内点击一律吞掉
+            }
+            // 搜索激活时点击别处 = 先收起搜索（然后照常处理这次点击）
+            if (m_Search != null && m_Search.IsActive) m_Search.Deactivate();
             if (m_Hud != null && m_Hud.ContainsScreenPoint(pos)) return;       // 点在 HUD 面板上
 
             int hit = PickAt(pos);
@@ -401,7 +498,33 @@ namespace Galaxy
         {
             if (m_Data == null || index < 0 || index >= m_Data.positions.Length) return;
             EnsureViewer();
-            m_Viewer.Show(m_Data.graph.root, m_Data.graph.nodes[index]);
+            m_Viewer.Show(m_Data.graph.root, m_Data.graph.nodes[index], index);
+        }
+
+        /// <summary>
+        /// 把源文件里的 include 文本（"lv_obj.h" 或 "core/lv_obj.h"）解析为节点下标
+        ///（-1 = 未解析到；语义与扫描器的 include 解析对齐：先精确/后缀命中，
+        /// 再按文件名兜底）。只查"引用了谁"方向的出边。
+        /// </summary>
+        public int ResolveInclude(int sourceIndex, string includeText)
+        {
+            if (m_Data == null || string.IsNullOrEmpty(includeText)) return -1;
+            if (sourceIndex < 0 || sourceIndex >= m_Data.positions.Length) return -1;
+
+            string needle = includeText.Replace('\\', '/').TrimStart('.', '/');
+            string needleName = System.IO.Path.GetFileName(needle);
+
+            List<int> incident = m_Incident[sourceIndex];
+            int fallback = -1;
+            for (int t = 0; t < incident.Count; t++)
+            {
+                GalaxyLink l = m_Data.graph.links[incident[t]];
+                if (l.source != sourceIndex) continue;
+                GalaxyNode target = m_Data.graph.nodes[l.target];
+                if (target.path == needle || target.path.EndsWith("/" + needle)) return l.target;
+                if (fallback < 0 && target.name == needleName) fallback = l.target;
+            }
+            return fallback;
         }
 
         private void EnsureViewer()
@@ -418,6 +541,48 @@ namespace Galaxy
             if (m_Loader == null) m_Loader = gameObject.AddComponent<GalaxyProjectLoader>();
         }
 
+        private void EnsureSearch()
+        {
+            if (m_Search != null) return;
+            m_Search = GetComponent<GalaxySearch>();
+            if (m_Search == null) m_Search = gameObject.AddComponent<GalaxySearch>();
+        }
+
+        private void EnsureSettings()
+        {
+            if (m_Settings != null) return;
+            m_Settings = GetComponent<GalaxySettings>();
+            if (m_Settings == null) m_Settings = gameObject.AddComponent<GalaxySettings>();
+        }
+
+        /// <summary>【诊断】设置面板冒烟：打开 → 步进 → APPLY 重建 → 关闭（自动化用）。
+        /// 注意：APPLY 会重建星系并清掉选中态 —— 调用方必须把它安排在截图之后。</summary>
+        public void DebugSmokeSettings()
+        {
+            EnsureSettings();
+            m_Settings.Toggle();
+            m_Settings.Handle("rim+");
+            m_Settings.Handle("rim-");
+            m_Settings.Handle("link+");
+            m_Settings.Handle("link-");
+            m_Settings.Handle("dust+");
+            m_Settings.Handle("dust-");
+            m_Settings.Handle("apply");
+            m_Settings.Toggle();
+            Debug.Log("[GalaxyPicker] 设置面板冒烟完成（开→步进→APPLY 重建→关）");
+        }
+
+        /// <summary>应用内截图（保存到 persistentDataPath/shots，状态栏给出路径）。</summary>
+        public void CaptureSnapshot()
+        {
+            string dir = System.IO.Path.Combine(Application.persistentDataPath, "shots");
+            System.IO.Directory.CreateDirectory(dir);
+            string file = System.IO.Path.Combine(dir, $"galaxy-{System.DateTime.Now:yyyyMMdd-HHmmss}.png");
+            ScreenCapture.CaptureScreenshot(file);
+            if (m_Hud != null) m_Hud.SetStatus("Snapshot: " + file);
+            Debug.Log($"[Galaxy] 截图已保存: {file}");
+        }
+
         /// <summary>关闭代码查看器（重建星系前调用：旧文件路径随新项目失效）。</summary>
         public void CloseViewer()
         {
@@ -427,29 +592,51 @@ namespace Galaxy
         // ---- 实体逐色调光：选中增亮、邻接增亮、其余压暗 ----
         private void ApplyEntityStates()
         {
-            SceneData d = m_Data;
-            for (int i = 0; i < d.renderers.Length; i++)
-            {
-                MeshRenderer r = d.renderers[i];
-                if (r == null) continue;
+            for (int i = 0; i < m_Data.renderers.Length; i++) ApplySingleEntity(i);
+        }
 
-                if (i == m_Selected)
-                {
-                    SetMpb(r, BrightenedFill(d, i, PolySelectedAlphaBoost), d.baseEmissions[i] * SelectedBoost);
-                }
-                else if (m_Neighbors.Contains(i))
-                {
-                    SetMpb(r, BrightenedFill(d, i, PolyNeighborAlphaBoost), d.baseEmissions[i] * NeighborBoost);
-                }
-                else
-                {
-                    Color b = d.baseColors[i];
-                    Color e = d.baseEmissions[i];
-                    SetMpb(r,
-                        new Color(b.r * DimBaseColor, b.g * DimBaseColor, b.b * DimBaseColor, b.a * DimBaseAlpha),
-                        new Color(e.r * DimEmission, e.g * DimEmission, e.b * DimEmission, e.a));
-                }
+        // 单个实体的状态调色（悬停还原只重套这一个实体，不必全量重算）
+        private void ApplySingleEntity(int i)
+        {
+            SceneData d = m_Data;
+            MeshRenderer r = d.renderers[i];
+            if (r == null) return;
+
+            if (i == m_Selected)
+            {
+                SetMpb(r, BrightenedFill(d, i, PolySelectedAlphaBoost), d.baseEmissions[i] * SelectedBoost);
             }
+            else if (m_Neighbors.Contains(i))
+            {
+                SetMpb(r, BrightenedFill(d, i, PolyNeighborAlphaBoost), d.baseEmissions[i] * NeighborBoost);
+            }
+            else
+            {
+                Color b = d.baseColors[i];
+                Color e = d.baseEmissions[i];
+                SetMpb(r,
+                    new Color(b.r * DimBaseColor, b.g * DimBaseColor, b.b * DimBaseColor, b.a * DimBaseAlpha),
+                    new Color(e.r * DimEmission, e.g * DimEmission, e.b * DimEmission, e.a));
+            }
+        }
+
+        // 悬停预览：命中实体临时给一档自发光 + 多面体填充增亮（移开即由
+        // ApplySingleEntity 还原到当前选中态；选中实体本身不参与悬停）
+        private void ApplyHover(int index)
+        {
+            if (index < 0 || index >= m_Data.renderers.Length || index == m_Selected) return;
+            MeshRenderer r = m_Data.renderers[index];
+            if (r == null) return;
+            SceneData d = m_Data;
+            SetMpb(r, BrightenedFill(d, index, PolyNeighborAlphaBoost),
+                   d.baseEmissions[index] * HoverEmission);
+        }
+
+        /// <summary>连线亮度系数（设置面板）：乘在默认色上；高亮金线不受影响。</summary>
+        public void SetLinkBrightness(float factor)
+        {
+            m_LinkBrightness = factor;
+            RebuildLinksColors();
         }
 
         // 多面体（立方体/正四面体）填充增亮：球体不透明（原样返回）；多面体填充
@@ -490,6 +677,17 @@ namespace Galaxy
             Color[] colors = m_LinkScratch;
             System.Array.Copy(m_Data.linkDefaultColors, colors, colors.Length);
 
+            // 亮度系数（设置面板）：先缩放默认色，再叠加选中态的金线/压暗
+            if (!Mathf.Approximately(m_LinkBrightness, 1f))
+            {
+                for (int i = 0; i < colors.Length; i++)
+                {
+                    Color c = colors[i];
+                    colors[i] = new Color(c.r * m_LinkBrightness, c.g * m_LinkBrightness,
+                                          c.b * m_LinkBrightness, c.a * m_LinkBrightness);
+                }
+            }
+
             if (m_Selected >= 0)
             {
                 System.Array.Clear(m_EdgeMark, 0, m_EdgeMark.Length);
@@ -502,9 +700,12 @@ namespace Galaxy
                     int v1 = v0 + 1;
                     if (m_EdgeMark[e])
                     {
-                        bool srcSelected = m_Data.graph.links[e].source == m_Selected;
-                        colors[v0] = srcSelected ? HighlightColor : HighlightColorFar;
-                        colors[v1] = srcSelected ? HighlightColorFar : HighlightColor;
+                        // v0 = source 端、v1 = target 端；近端亮、远端淡，方向色区分
+                        bool outgoing = m_Data.graph.links[e].source == m_Selected;
+                        Color near = outgoing ? HighlightOutgoing : HighlightColor;
+                        Color far = outgoing ? HighlightOutgoingFar : HighlightColorFar;
+                        colors[v0] = outgoing ? near : far;
+                        colors[v1] = outgoing ? far : near;
                     }
                     else
                     {
@@ -567,6 +768,7 @@ namespace Galaxy
 
             m_OverlayVerts.Clear();
             m_OverlayColors.Clear();
+            m_OverlayUvs.Clear();
 
             Vector3 center = m_Data.positions[m_Selected];
             List<int> incident = m_Incident[m_Selected];
@@ -574,10 +776,22 @@ namespace Galaxy
             {
                 GalaxyLink l = m_Data.graph.links[incident[t]];
                 int other = l.source == m_Selected ? l.target : l.source;
+                Vector3 otherPos = m_Data.positions[other];
+                float len = Vector3.Distance(center, otherPos);
+                // 流光相位：uv.x = 距"依赖发出方"的世界长度（0 在 source 端）——
+                // 虚线短划因此永远从 source 流向 target（方向即依赖方向）；
+                // uv.y = 每条链的固定相位偏移（避免所有虚线对齐成一排）
+                float seed = (incident[t] % 7) * 0.137f;
+                bool selectedIsSource = l.source == m_Selected;
+                Color near = selectedIsSource ? HighlightOutgoing : HighlightColor;
+                Color far = selectedIsSource ? HighlightOutgoingFar : HighlightColorFar;
+
                 m_OverlayVerts.Add(center);
-                m_OverlayColors.Add(HighlightColor);
-                m_OverlayVerts.Add(m_Data.positions[other]);
-                m_OverlayColors.Add(HighlightColorFar);
+                m_OverlayColors.Add(near);
+                m_OverlayUvs.Add(selectedIsSource ? new Vector2(0f, seed) : new Vector2(len, seed));
+                m_OverlayVerts.Add(otherPos);
+                m_OverlayColors.Add(far);
+                m_OverlayUvs.Add(selectedIsSource ? new Vector2(len, seed) : new Vector2(0f, seed));
             }
 
             // 光晕半径比包络半径大一圈（"瞄准环"），三正交大圆构成线框球；
@@ -594,6 +808,7 @@ namespace Galaxy
             m_OverlayMesh.Clear();
             m_OverlayMesh.SetVertices(m_OverlayVerts);
             m_OverlayMesh.SetColors(m_OverlayColors);
+            m_OverlayMesh.SetUVs(0, m_OverlayUvs);
             m_OverlayMesh.SetIndices(indices, 0, indices.Length, MeshTopology.Lines, 0);
             m_OverlayMesh.RecalculateBounds();
             m_OverlayRenderer.enabled = true;
@@ -616,10 +831,15 @@ namespace Galaxy
             Shader shader = Shader.Find("Galaxy/OverlayLine");
             if (shader == null)
             {
-                Debug.LogWarning("[Pick] 未找到 Galaxy/OverlayLine，退回 Sprites/Default（高亮线会被前景实体遮挡）");
+                Debug.LogWarning("[Pick] 未找到 Galaxy/OverlayLine，退回 Sprites/Default（无流光且会被前景遮挡）");
                 shader = Shader.Find("Sprites/Default");
             }
-            m_OverlayRenderer.sharedMaterial = new Material(shader) { name = "galaxy-selection-overlay" };
+            var overlayMat = new Material(shader) { name = "galaxy-selection-overlay" };
+            // 流光参数：每 1.6 世界单位一个短划周期，0.8 周期/秒向 target 流动
+            overlayMat.SetFloat("_DashLength", 1.6f);
+            overlayMat.SetFloat("_FlowSpeed", 0.8f);
+            overlayMat.SetFloat("_DashDuty", 0.55f);
+            m_OverlayRenderer.sharedMaterial = overlayMat;
             m_OverlayRenderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
             m_OverlayRenderer.receiveShadows = false;
         }
@@ -643,6 +863,8 @@ namespace Galaxy
                 m_OverlayVerts.Add(center + CirclePoint(plane, a1, radius));
                 m_OverlayColors.Add(color);
                 m_OverlayColors.Add(color);
+                m_OverlayUvs.Add(new Vector2(-1f, 0f));   // uv.x<0 = 实线（光环不参与流光）
+                m_OverlayUvs.Add(new Vector2(-1f, 0f));
             }
         }
 
